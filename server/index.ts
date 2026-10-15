@@ -43,7 +43,7 @@ app.get('/api/projects/:id/trace', (req, res) => {
   const { id } = req.params
   const trace = loadTrace(id)
   if (!trace) {
-    res.status(404).json({ error: '该项目尚无录制轨迹数据' })
+    res.status(404).json({ error: '该任务尚无录制轨迹数据' })
     return
   }
   res.json(trace)
@@ -54,7 +54,7 @@ app.get('/api/projects/:id/workflow', (req, res) => {
   const { id } = req.params
   const workflow = loadWorkflow(id)
   if (!workflow) {
-    res.status(404).json({ error: '该项目尚未通过大模型生成操作工作流' })
+    res.status(404).json({ error: '该任务尚未通过大模型生成操作工作流' })
     return
   }
   res.json(workflow)
@@ -71,7 +71,7 @@ app.put('/api/projects/:id/parameters', (req, res) => {
 
   const updatedWorkflow = updateWorkflowParameters(id, parameters)
   if (!updatedWorkflow) {
-    res.status(404).json({ error: '该项目尚未生成操作工作流，无法更新参数' })
+    res.status(404).json({ error: '该任务尚未生成操作工作流，无法更新参数' })
     return
   }
 
@@ -90,7 +90,7 @@ app.post('/api/projects', async (req, res) => {
     autoOpenBrowser?: boolean
   }
   if (!name || !name.trim()) {
-    res.status(400).json({ error: '项目名称不能为空' })
+    res.status(400).json({ error: '任务名称不能为空' })
     return
   }
 
@@ -136,7 +136,7 @@ app.post('/api/projects/:id/record/start', async (req, res) => {
   const projects = loadProjects()
   const target = projects.find((p) => p.id === id)
   if (!target) {
-    res.status(404).json({ error: '未找到该项目' })
+    res.status(404).json({ error: '未找到该任务' })
     return
   }
 
@@ -160,7 +160,7 @@ app.post('/api/projects/:id/record/stop', async (req, res) => {
   const projects = loadProjects()
   const target = projects.find((p) => p.id === id)
   if (!target) {
-    res.status(404).json({ error: '未找到该项目' })
+    res.status(404).json({ error: '未找到该任务' })
     return
   }
 
@@ -206,7 +206,7 @@ app.post('/api/projects/:id/run', async (req, res) => {
   const projects = loadProjects()
   const target = projects.find((p) => p.id === id)
   if (!target) {
-    res.status(404).json({ error: '未找到该项目' })
+    res.status(404).json({ error: '未找到该任务' })
     return
   }
 
@@ -243,11 +243,11 @@ app.post('/api/projects/:id/compile', async (req, res) => {
   const projects = loadProjects()
   const target = projects.find((p) => p.id === id)
   if (!target) {
-    res.status(404).json({ error: '未找到该项目' })
+    res.status(404).json({ error: '未找到该任务' })
     return
   }
   if (!trace || !trace.events || trace.events.length === 0) {
-    res.status(400).json({ error: '该项目尚无录制轨迹数据，请先录制操作' })
+    res.status(400).json({ error: '该任务尚无录制轨迹数据，请先录制操作' })
     return
   }
 

@@ -208,7 +208,7 @@ export function App() {
   }
 
   const handleViewTrace = async (project: Project) => {
-    let traceJson = '// 当前项目还没有录制到操作轨迹，请点击“录制”在内置浏览器中进行操作。'
+    let traceJson = '// 当前任务还没有录制到操作轨迹，请点击“录制”在内置浏览器中进行操作。'
     let workflow: OperationWorkflow | null = null
     let workflowJson: string | null = null
     const paramDrafts: Record<string, string> = {}
@@ -417,11 +417,11 @@ export function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
-      {/* 主体内容区：我的项目 */}
+      {/* 主体内容区：我的任务 */}
       <main className="mx-auto max-w-6xl px-6 py-8">
         {/* 工具栏 */}
         <div className="mb-6 flex items-center justify-between gap-4">
-          <h2 className="text-xl font-bold text-slate-900">我的项目</h2>
+          <h2 className="text-xl font-bold text-slate-900">我的任务</h2>
 
           <div className="flex items-center gap-3">
             <div className="relative">
@@ -430,7 +430,7 @@ export function App() {
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="搜索项目..."
+                placeholder="搜索任务..."
                 className="h-9 w-64 rounded-lg border border-slate-200 bg-white pl-9 pr-3 text-sm text-slate-800 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none"
               />
             </div>
@@ -440,15 +440,15 @@ export function App() {
               className="inline-flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg bg-slate-900 px-3.5 text-sm font-medium text-white shadow-xs transition hover:bg-slate-800 cursor-pointer"
             >
               <Plus className="h-4 w-4" />
-              新建项目
+              新建任务
             </button>
           </div>
         </div>
 
-        {/* 项目卡片列表 */}
+        {/* 任务卡片列表 */}
         {filteredProjects.length === 0 ? (
           <div className="rounded-xl border border-dashed border-slate-300 bg-white p-12 text-center">
-            <p className="text-sm text-slate-500">没有找到匹配的项目，点击右上角新建一个吧。</p>
+            <p className="text-sm text-slate-500">没有找到匹配的任务，点击右上角新建一个吧。</p>
           </div>
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -467,7 +467,7 @@ export function App() {
                       </h3>
                       <button
                         onClick={() => handleDeleteProject(project.id)}
-                        title="删除项目"
+                        title="删除任务"
                         className="rounded-md p-1 text-slate-400 opacity-0 transition hover:bg-slate-100 hover:text-rose-600 group-hover:opacity-100 cursor-pointer"
                       >
                         <Trash2 className="h-4 w-4" />
@@ -560,12 +560,12 @@ export function App() {
         )}
       </main>
 
-      {/* 新建项目弹窗 */}
+      {/* 新建任务弹窗 */}
       {isCreateOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs">
           <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
             <div className="mb-4 flex items-center justify-between">
-              <h3 className="text-base font-semibold text-slate-900">新建项目</h3>
+              <h3 className="text-base font-semibold text-slate-900">新建任务</h3>
               <button
                 onClick={() => setIsCreateOpen(false)}
                 className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 cursor-pointer"
@@ -577,7 +577,7 @@ export function App() {
             <form onSubmit={handleCreateProject} className="space-y-4">
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-700">
-                  项目名称 *
+                  任务名称 *
                 </label>
                 <input
                   type="text"
@@ -621,7 +621,7 @@ export function App() {
                       正在启动浏览器...
                     </>
                   ) : (
-                    '创建项目'
+                    '创建任务'
                   )}
                 </button>
               </div>
@@ -724,11 +724,11 @@ export function App() {
             {dataModal.activeTab === 'visual' ? (
               !dataModal.workflow ? (
                 <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-10 text-center text-xs text-slate-500">
-                  当前项目尚未生成结构化工作流，请点击右上角“调用大模型生成工作流”按钮进行清洗与参数提炼。
+                  当前任务尚未生成结构化工作流，请点击右上角“调用大模型生成工作流”按钮进行清洗与参数提炼。
                 </div>
               ) : (
                 <div className="max-h-96 space-y-5 overflow-y-auto pr-1">
-                  {/* 1. 项目动态参数配置区 */}
+                  {/* 1. 任务动态参数配置区 */}
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
                     <div className="mb-3 flex items-center justify-between">
                       <div>
@@ -736,7 +736,7 @@ export function App() {
                           动态运行参数（每次执行前可修改）
                         </h4>
                         <p className="text-xs text-slate-500">
-                          大模型已自动将输入框填写等可变操作抽离为项目参数
+                          大模型已自动将输入框填写等可变操作抽离为任务参数
                         </p>
                       </div>
                       {dataModal.workflow.parameters.length > 0 && (
@@ -897,7 +897,7 @@ export function App() {
 
             {historyProject.runs.length === 0 ? (
               <div className="py-8 text-center text-sm text-slate-500">
-                该项目还没有运行记录，点击“立即运行”试试看吧。
+                该任务还没有运行记录，点击“立即运行”试试看吧。
               </div>
             ) : (
               <div className="max-h-80 space-y-2.5 overflow-y-auto pr-1">
