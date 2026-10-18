@@ -9,6 +9,8 @@
 > **L3 视觉 Agent**：协议 / sidecar / 执行器钩子 / 预算与安全约束 → [`L3-VISUAL-AGENT.md`](./L3-VISUAL-AGENT.md)
 >
 > **测试与真站回归**：测试分层、真站矩阵与已修复缺陷 → [`TESTING.md`](./TESTING.md)
+>
+> **CI**：push/PR 自动跑 `lint → build → npm test`（GitHub Actions）
 
 ![系统架构](./architecture.png)
 
@@ -127,6 +129,11 @@ flowchart TB
 │   └── types.ts             # 兼容入口：re-export shared/types.ts
 ├── visual-agent/
 │   └── server.py            # L3 内网视觉 Agent sidecar（mock + 真实模型接入点）
+├── tests/
+│   ├── compiler.test.mjs    # 规则清洗/编译/标注 Schema 单测
+│   └── enrich.test.mjs      # 录制证据增强单测
+├── .github/workflows/
+│   └── ci.yml               # CI：lint / build / test
 ├── public/                  # favicon.svg（在用）；icons.svg（⚠ 模板残留）
 ├── data/                    # 运行时数据（.gitignore，见 §9）
 ├── .browsers/               # 项目自带 Chromium（.gitignore）
