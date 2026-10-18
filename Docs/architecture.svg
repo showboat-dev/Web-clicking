@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="1660" viewBox="0 0 1760 1660" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Noto Sans CJK SC, Helvetica, Arial, sans-serif">
+<defs>
+<marker id="ah-slate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0f172a"/></marker>
+<marker id="ah-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+<marker id="ah-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker>
+<marker id="ah-cyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0891b2"/></marker>
+<marker id="ah-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker>
+<marker id="ah-emerald" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker>
+<linearGradient id="hdr" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f172a"/><stop offset="1" stop-color="#1e293b"/></linearGradient>
+</defs>
+<rect width="1760" height="1660" fill="#f8fafc"/>
+<rect x="0" y="0" width="1760" height="140" fill="url(#hdr)"/>
+<text x="64" y="62" font-size="32" font-weight="700" fill="#ffffff" letter-spacing="0.5">网页操作流自动化（Web-Clicking）· 系统架构</text>
+<text x="64" y="98" font-size="15" fill="#cbd5e1">录制真实浏览器操作 → DeepSeek 清洗编译为「部分固定 / 部分参数化」工作流 → Playwright 确定性回放 · v2：异步运行 + WS 进度</text>
+<text x="1696" y="58" font-size="14" fill="#94a3b8" text-anchor="end">React 19 · Vite 8 · Tailwind 4 · TypeScript 6</text>
+<text x="1696" y="86" font-size="14" fill="#94a3b8" text-anchor="end">Node 26 · Express 5 · Playwright 1.64 · WebSocket · DeepSeek</text>
+<text x="1696" y="114" font-size="12" fill="#64748b" text-anchor="end">前端 5173（dev）· 后端 3001 · 单仓库单进程 POC</text>
+<rect x="40" y="160" width="1680" height="160" rx="18" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+<rect x="58" y="172" width="131" height="28" rx="8" fill="#2563eb"/>
+<text x="123.5" y="191" font-size="14" font-weight="600" fill="#ffffff" text-anchor="middle">① 界面层</text>
+<rect x="80" y="206" width="196" height="104" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="80" y="206" width="6" height="104" rx="3" fill="#2563eb"/>
+<text x="102" y="235" font-size="19" font-weight="700" fill="#0f172a">用户</text>
+<text x="102" y="260" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>业务 / 运营人员</text>
+<rect x="336" y="206" width="764" height="104" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="336" y="206" width="6" height="104" rx="3" fill="#2563eb"/>
+<text x="358" y="235" font-size="17" font-weight="700" fill="#0f172a">前端 SPA · React 19 · Vite 8 · Tailwind CSS 4</text>
+<text x="358" y="255" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">src/App.tsx（131 行组合层）· components/ · hooks/ · api/</text>
+<text x="358" y="278" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>我的任务（卡片列表 / 搜索 / 新建 / 删除）· 录制控制 · 立即运行 · 执行历史</text>
+<text x="358" y="299" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>参数与步骤视图 · 工作流 JSON · 原始轨迹 JSON · 运行进度条（WS 实时）</text>
+<rect x="1160" y="206" width="540" height="104" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="1160" y="206" width="6" height="104" rx="3" fill="#2563eb"/>
+<text x="1182" y="235" font-size="16" font-weight="700" fill="#0f172a">用户触达面</text>
+<text x="1182" y="260" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>管理台：http://localhost:5173（前端 SPA）</text>
+<text x="1182" y="281" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>被录制的浏览器：由后端 Playwright 拉起（有头窗口）</text>
+<text x="1182" y="302" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>执行进度：WS 实时回推步骤序号；结果写入执行历史</text>
+<line x1="276" y1="258" x2="332" y2="258" stroke="#0f172a" stroke-width="2" marker-end="url(#ah-slate)" stroke-linecap="round"/>
+<text x="283" y="249" font-size="10" fill="#64748b" text-anchor="start">操作</text>
+<rect x="40" y="370" width="1680" height="150" rx="18" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+<rect x="58" y="382" width="131" height="28" rx="8" fill="#7c3aed"/>
+<text x="123.5" y="401" font-size="14" font-weight="600" fill="#ffffff" text-anchor="middle">② 通信层</text>
+<rect x="80" y="416" width="700" height="100" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="80" y="416" width="6" height="100" rx="3" fill="#7c3aed"/>
+<text x="102" y="445" font-size="16" font-weight="700" fill="#0f172a">HTTP REST · JSON</text>
+<text x="102" y="465" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">/api/* · fetch → Vite 代理 → Express</text>
+<text x="102" y="488" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>GET /api/projects · POST /api/projects · DELETE /api/projects/:id</text>
+<text x="102" y="509" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>GET trace / workflow · PUT parameters · POST run / compile / record/*</text>
+<rect x="820" y="416" width="440" height="100" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="820" y="416" width="6" height="100" rx="3" fill="#7c3aed"/>
+<text x="842" y="445" font-size="16" font-weight="700" fill="#0f172a">WebSocket · /ws</text>
+<text x="842" y="465" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">实时事件通道（ws 8.22）</text>
+<text x="842" y="488" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>trace_updated：录制步骤数 + 最新事件</text>
+<text x="842" y="509" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>run_started / run_progress / run_finished：异步运行进度</text>
+<rect x="1300" y="416" width="400" height="100" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4" stroke-dasharray="6 5"/>
+<rect x="1300" y="416" width="6" height="100" rx="3" fill="#7c3aed"/>
+<text x="1322" y="445" font-size="16" font-weight="700" fill="#0f172a">Vite Dev Proxy</text>
+<text x="1322" y="465" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">vite.config.ts · 仅开发态</text>
+<text x="1322" y="488" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>/api → http://localhost:3001</text>
+<text x="1322" y="509" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>/ws → ws://localhost:3001（ws: true）</text>
+<rect x="40" y="570" width="1680" height="170" rx="18" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+<rect x="58" y="582" width="131" height="28" rx="8" fill="#0f172a"/>
+<text x="123.5" y="601" font-size="14" font-weight="600" fill="#ffffff" text-anchor="middle">③ 服务层</text>
+<rect x="80" y="616" width="1620" height="108" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="80" y="616" width="6" height="108" rx="3" fill="#0f172a"/>
+<text x="102" y="645" font-size="16" font-weight="700" fill="#0f172a">Express 5 HTTP 服务 + WS 广播 · server/index.ts（365 行）</text>
+<text x="102" y="665" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">Node 26 原生 TypeScript 类型擦除，node server/index.ts 直接运行 · 单进程</text>
+<text x="102" y="688" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>任务 CRUD ｜ 录制 start / stop ｜ 编译 compile ｜ 运行 run（202 立即受理，后台执行）｜ 参数更新 ｜ 截图 ｜ 健康检查</text>
+<text x="102" y="709" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>onTraceUpdated / onStep → WS broadcast ｜ 运行并发保护（已有任务执行中 → 409）</text>
+<rect x="40" y="790" width="1680" height="250" rx="18" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+<rect x="58" y="802" width="161" height="28" rx="8" fill="#0891b2"/>
+<text x="138.5" y="821" font-size="14" font-weight="600" fill="#ffffff" text-anchor="middle">④ 核心引擎层</text>
+<rect x="80" y="838" width="520" height="192" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="80" y="838" width="6" height="192" rx="3" fill="#d97706"/>
+<text x="102" y="867" font-size="16" font-weight="700" fill="#0f172a">翻译器（规则 + AI 标注）</text>
+<text x="102" y="887" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">compiler.ts + ai.ts · DeepSeek</text>
+<text x="102" y="910" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>① 规则清洗：合成点击 / 被动跳转 / 聚焦合并 / 空标签页</text>
+<text x="102" y="931" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>② 规则编译：原子动作 → IR（无 AI 也可执行）</text>
+<text x="102" y="952" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>③ AI 仅语义标注：标题 / 参数命名（自动回退）</text>
+<text x="102" y="973" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>Schema 校验 + 覆盖审计（dropReasons）+ translatorVersion</text>
+<text x="102" y="994" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>动态读取 .env，填 Key 后无需重启</text>
+<rect x="640" y="838" width="620" height="192" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="640" y="838" width="6" height="192" rx="3" fill="#0891b2"/>
+<text x="662" y="867" font-size="16" font-weight="700" fill="#0f172a">录制 / 执行引擎</text>
+<text x="662" y="887" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">server/playwrightEngine.ts（1098 行）</text>
+<text x="662" y="910" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>采集 click/dblclick/右键/hover/拖拽/滚动/输入/上传/弹窗/下载</text>
+<text x="662" y="931" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>exposeBinding → 五层上下文 + 证据 + JPEG 截图</text>
+<text x="662" y="952" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>生命周期监听：framenavigated / page close / 新标签页</text>
+<text x="662" y="973" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>候选定位器 priority 1→7 降级（role 走 getByRole，v2 修复）</text>
+<text x="662" y="994" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>L1/L2 定位恢复 · 后置校验 · onStep 进度 + 逐层遥测</text>
+<rect x="1300" y="838" width="400" height="192" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="1300" y="838" width="6" height="192" rx="3" fill="#0891b2"/>
+<text x="1322" y="867" font-size="16" font-weight="700" fill="#0f172a">内置 Chromium</text>
+<text x="1322" y="887" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">.browsers/chromium-1248</text>
+<text x="1322" y="910" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>launchPersistentContext（headful）</text>
+<text x="1322" y="931" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>profile：data/browser-profile/</text>
+<text x="1322" y="952" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>保留企业 SSO 登录态</text>
+<text x="1322" y="973" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>viewport: null · --start-maximized</text>
+<text x="1322" y="994" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>由后端通过 CDP 驱动</text>
+<line x1="600" y1="902" x2="636" y2="902" stroke="#d97706" stroke-width="2" marker-end="url(#ah-amber)" stroke-linecap="round"/>
+<text x="597" y="893" font-size="10" fill="#d97706" text-anchor="end">工作流</text>
+<line x1="1260" y1="902" x2="1296" y2="902" stroke="#0891b2" stroke-width="2" marker-end="url(#ah-cyan)" stroke-linecap="round"/>
+<text x="1263" y="893" font-size="10" fill="#0891b2" text-anchor="start">CDP</text>
+<rect x="40" y="1090" width="1680" height="210" rx="18" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+<rect x="58" y="1102" width="206" height="28" rx="8" fill="#059669"/>
+<text x="161.0" y="1121" font-size="14" font-weight="600" fill="#ffffff" text-anchor="middle">⑤ 数据与外部资源层</text>
+<rect x="80" y="1138" width="360" height="150" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="80" y="1138" width="6" height="150" rx="3" fill="#d97706"/>
+<text x="102" y="1167" font-size="16" font-weight="700" fill="#0f172a">DeepSeek 云端</text>
+<text x="102" y="1187" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">api.deepseek.com</text>
+<text x="102" y="1210" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>chat/completions · deepseek-chat</text>
+<text x="102" y="1231" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>JSON 输出模式</text>
+<text x="102" y="1252" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>提示词在此编译为结构化工作流</text>
+<rect x="480" y="1138" width="880" height="150" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="480" y="1138" width="6" height="150" rx="3" fill="#059669"/>
+<text x="502" y="1167" font-size="16" font-weight="700" fill="#0f172a">存储仓储 · server/store.ts（227 行）</text>
+<text x="502" y="1187" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">data/ · JSON 文件 + 本地目录（.gitignore）</text>
+<text x="502" y="1210" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>projects.json（任务索引 + trace/workflow 冗余副本）· traces/&lt;id&gt;.json</text>
+<text x="502" y="1231" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>workflows/&lt;id&gt;.json · screenshots/&lt;id&gt;/&lt;eventId&gt;.jpg · browser-profile/</text>
+<text x="502" y="1252" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>appendRecordedEvent 合并 fill · RunRecord + 遥测落库 · 失败现场截图</text>
+<rect x="1400" y="1138" width="300" height="150" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.4"/>
+<rect x="1400" y="1138" width="6" height="150" rx="3" fill="#0f172a"/>
+<text x="1422" y="1167" font-size="16" font-weight="700" fill="#0f172a">目标业务系统</text>
+<text x="1422" y="1187" font-size="12" fill="#64748b" font-family="SFMono-Regular, Menlo, Consolas, monospace">内网 / 公网页面 · SSO</text>
+<text x="1422" y="1210" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>录制与回放的真实操作对象</text>
+<text x="1422" y="1231" font-size="13" fill="#334155"><tspan fill="#94a3b8">· </tspan>多标签页 / iframe 支持</text>
+<rect x="40" y="1350" width="1680" height="200" rx="18" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+<rect x="58" y="1362" width="566" height="28" rx="8" fill="#e11d48"/>
+<text x="341.0" y="1381" font-size="14" font-weight="600" fill="#ffffff" text-anchor="middle">⑥ 健壮性兜底（横切）· 录制存证据 / 翻译留退路 / 执行做验证</text>
+<rect x="68" y="1392" width="385" height="118" rx="10" fill="#ffffff" stroke="#059669" stroke-width="1.4"/>
+<rect x="68" y="1392" width="5" height="118" rx="2.5" fill="#059669"/>
+<rect x="86" y="1406" width="40" height="22" rx="5" fill="#059669"/>
+<text x="106" y="1422" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">L1</text>
+<text x="134" y="1422" font-size="13" font-weight="700" fill="#0f172a">语义定位（主路径）</text>
+<text x="86" y="1446" font-size="11.5" fill="#334155">· testId · role+name · label · text</text>
+<text x="86" y="1464" font-size="11.5" fill="#334155">· Playwright 自动等待</text>
+<text x="86" y="1500" font-size="10.5" fill="#94a3b8">失败则升级下一级</text>
+<line x1="455" y1="1444" x2="475" y2="1444" stroke="#94a3b8" stroke-width="2" marker-end="url(#ah-slate)"/>
+<rect x="481" y="1392" width="385" height="118" rx="10" fill="#ffffff" stroke="#0891b2" stroke-width="1.4"/>
+<rect x="481" y="1392" width="5" height="118" rx="2.5" fill="#0891b2"/>
+<rect x="499" y="1406" width="40" height="22" rx="5" fill="#0891b2"/>
+<text x="519" y="1422" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">L2</text>
+<text x="547" y="1422" font-size="13" font-weight="700" fill="#0f172a">结构证据恢复</text>
+<text x="499" y="1446" font-size="11.5" fill="#334155">· frameLocator · shadow host 链</text>
+<text x="499" y="1464" font-size="11.5" fill="#334155">· DOM 快照 + 邻近锚点 + bbox</text>
+<text x="499" y="1500" font-size="10.5" fill="#94a3b8">失败则升级下一级</text>
+<line x1="868" y1="1444" x2="888" y2="1444" stroke="#94a3b8" stroke-width="2" marker-end="url(#ah-slate)"/>
+<rect x="894" y="1392" width="385" height="118" rx="10" fill="#ffffff" stroke="#d97706" stroke-width="1.4"/>
+<rect x="894" y="1392" width="5" height="118" rx="2.5" fill="#d97706"/>
+<rect x="912" y="1406" width="40" height="22" rx="5" fill="#d97706"/>
+<text x="932" y="1422" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">L3</text>
+<text x="960" y="1422" font-size="13" font-weight="700" fill="#0f172a">内网视觉 Agent 兜底</text>
+<text x="912" y="1446" font-size="11.5" fill="#334155">· sidecar /ground（截图不出网）</text>
+<text x="912" y="1464" font-size="11.5" fill="#334155">· 坐标动作 + 统一验证 + 预算</text>
+<text x="912" y="1500" font-size="10.5" fill="#94a3b8">失败则升级下一级</text>
+<line x1="1281" y1="1444" x2="1301" y2="1444" stroke="#94a3b8" stroke-width="2" marker-end="url(#ah-slate)"/>
+<rect x="1307" y="1392" width="385" height="118" rx="10" fill="#ffffff" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="1307" y="1392" width="5" height="118" rx="2.5" fill="#7c3aed"/>
+<rect x="1325" y="1406" width="40" height="22" rx="5" fill="#7c3aed"/>
+<text x="1345" y="1422" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">L4</text>
+<text x="1373" y="1422" font-size="13" font-weight="700" fill="#0f172a">失败终止 + 自动重编译</text>
+<text x="1325" y="1446" font-size="11.5" fill="#334155">· 终止 + 留存失败现场 + 告警</text>
+<text x="1325" y="1464" font-size="11.5" fill="#334155">· 自动重编译 IR（可回滚）+ 回归</text>
+<text x="1325" y="1500" font-size="10.5" fill="#94a3b8">失败则升级下一级</text>
+<text x="88" y="1534" font-size="11.5" fill="#334155">每级动作后置验证：URL / 标题 / 关键文本 / 输入值 / DOM 变化 → 未通过升级下一级，禁止静默继续；破坏性操作（提交/支付）暂停等待人工确认（审批闸门，不接管）</text>
+<text x="88" y="1552" font-size="11" fill="#64748b">约束：公网任意站点 · 全自动跑完 · 截图不出网 · 可用内网视觉模型 ｜ 详见 Docs/pipeline-robustness.png</text>
+<line x1="880" y1="320" x2="880" y2="366" stroke="#0f172a" stroke-width="2" marker-end="url(#ah-slate)" stroke-linecap="round"/>
+<text x="892" y="348" font-size="11" fill="#64748b" text-anchor="start">fetch /api · new WebSocket</text>
+<line x1="880" y1="520" x2="880" y2="566" stroke="#0f172a" stroke-width="2" marker-end="url(#ah-slate)" stroke-linecap="round"/>
+<text x="892" y="548" font-size="11" fill="#64748b" text-anchor="start">JSON 请求 / 响应</text>
+<line x1="880" y1="740" x2="880" y2="786" stroke="#0f172a" stroke-width="2" marker-end="url(#ah-slate)" stroke-linecap="round"/>
+<text x="892" y="768" font-size="11" fill="#64748b" text-anchor="start">编排调用</text>
+<line x1="1010" y1="566" x2="1010" y2="520" stroke="#7c3aed" stroke-width="2" marker-end="url(#ah-violet)" stroke-dasharray="6 5" stroke-linecap="round"/>
+<text x="1022" y="548" font-size="10" fill="#7c3aed" text-anchor="start">事件推送（录制 / 运行）</text>
+<line x1="340" y1="1030" x2="340" y2="1086" stroke="#d97706" stroke-width="2" marker-end="url(#ah-amber)" stroke-linecap="round"/>
+<text x="352" y="1062" font-size="11" fill="#d97706" text-anchor="start">HTTPS</text>
+<line x1="880" y1="1030" x2="880" y2="1086" stroke="#059669" stroke-width="2" marker-end="url(#ah-emerald)" stroke-linecap="round"/>
+<text x="892" y="1062" font-size="11" fill="#059669" text-anchor="start">读写 JSON</text>
+<line x1="1540" y1="1030" x2="1540" y2="1086" stroke="#0f172a" stroke-width="2" marker-end="url(#ah-slate)" stroke-linecap="round"/>
+<text x="1552" y="1062" font-size="11" fill="#64748b" text-anchor="start">导航 / 操作</text>
+<line x1="40" y1="1594" x2="1720" y2="1594" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="64" y="1622" font-size="12.5" fill="#334155"><tspan font-weight="700" fill="#0f172a">核心数据流：</tspan>录制事件 → RecordingTrace → DeepSeek 清洗编译 → OperationWorkflow（fixed / parameterized + 参数表）→ Playwright 执行 → RunRecord；运行请求 202 立即受理，进度与结果经 WebSocket 回推</text>
+<text x="64" y="1644" font-size="12" fill="#64748b">图例：实线 = 请求 / 调用，虚线 = 推送 / 仅开发态；①→⑤ 为自上而下的请求链路</text>
+</svg>

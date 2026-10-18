@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { chromium, type BrowserContext, type Frame, type Page } from 'playwright'
+import { chromium, type BrowserContext, type Frame, type Locator, type Page } from 'playwright'
 import {
   appendRecordedEvent,
   BROWSER_PROFILE_DIR,
@@ -8,14 +8,28 @@ import {
   loadProjects,
   loadTrace,
   loadWorkflow,
+  replaceTrailingClickWithDblclick,
   SCREENSHOTS_DIR,
 } from './store.ts'
+import {
+  canUseVisualAgent,
+  getVisualAgentConfig,
+  loadScreenshotDataUrl,
+  requestGrounding,
+  resetVisualAgentBudget,
+} from './visualAgent.ts'
 import type {
   CandidateLocator,
+  FrameRef,
+  LocatorStrategy,
   OperationWorkflow,
   RecordedEvent,
   RecordingTrace,
   RunRecord,
+  StepExecutionLog,
+  StepRecovery,
+  StepProgress,
+  StepVerificationResult,
 } from './types.ts'
 
 // 指向项目内置的 .browsers 目录
@@ -32,6 +46,18 @@ let tabCounter = 0
 type TraceUpdateListener = (projectId: string, trace: RecordingTrace, latestEvent: RecordedEvent) => void
 const traceListeners = new Set<TraceUpdateListener>()
 
+/** 步骤级进度回调：每完成一个工作流步骤或一条回放事件后上报一次 */
+export interface RunOptions {
+  onStep?: (progress: StepProgress) => void
+}
+
+// 同一时刻只允许一个任务运行（共用一个持久化浏览器上下文）
+let activeRunProjectId: string | null = null
+
+export function getActiveRunProjectId(): string | null {
+  return activeRunProjectId
+}
+
 export function onTraceUpdated(listener: TraceUpdateListener) {
   traceListeners.add(listener)
   return () => traceListeners.delete(listener)
@@ -45,6 +71,24 @@ function notifyTraceListeners(projectId: string, trace: RecordingTrace, latestEv
       // ignore listener errors
     }
   }
+}
+
+function buildFrameChain(frame: Frame): FrameRef[] {
+  const chain: FrameRef[] = []
+  const mainFrame = frame.page().mainFrame()
+  let current: Frame | null = frame
+  while (current && current !== mainFrame) {
+    const parent = current.parentFrame()
+    const siblings = parent ? parent.childFrames() : []
+    const index = siblings.indexOf(current)
+    chain.unshift({
+      url: current.url(),
+      ...(current.name() ? { name: current.name() } : {}),
+      ...(index >= 0 ? { index } : {}),
+    })
+    current = parent
+  }
+  return chain
 }
 
 function getOrAssignTabId(page: Page): string {
@@ -188,8 +232,7 @@ const INJECTED_RECORDER_SCRIPT = `
     }
     const ariaLabel = el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title');
     if (ariaLabel) return ariaLabel.trim().slice(0, 60);
-    const prev = el.previousElementSibling;
-    if (prev && prev.innerText) return prev.innerText.trim().slice(0, 60);
+    // 注意：不再使用「前一个兄弟元素」兜底——真实站点上它经常是无关文案（曾把 Submit 记成 Default radio）
     return undefined;
   }
 
@@ -204,6 +247,40 @@ const INJECTED_RECORDER_SCRIPT = `
     if (tag === 'input' && el.type === 'checkbox') return 'checkbox';
     if (tag === 'input' && el.type === 'radio') return 'radio';
     return undefined;
+  }
+
+  function nthOfTypePath(el) {
+    if (!(el instanceof Element)) return '';
+    if (el.id) return '#' + CSS.escape(el.id);
+    const parts = [];
+    let cur = el;
+    while (cur && cur.nodeType === Node.ELEMENT_NODE && parts.length < 4) {
+      let selector = cur.nodeName.toLowerCase();
+      let nth = 1;
+      let sib = cur;
+      while ((sib = sib.previousElementSibling)) {
+        if (sib.nodeName.toLowerCase() === selector) nth++;
+      }
+      if (nth > 1) selector += ':nth-of-type(' + nth + ')';
+      parts.unshift(selector);
+      cur = cur.parentElement;
+    }
+    return parts.join(' > ');
+  }
+
+  function shadowChainFor(el) {
+    const hosts = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE) {
+      const root = node.getRootNode ? node.getRootNode() : null;
+      if (root && root.host) {
+        hosts.unshift(nthOfTypePath(root.host));
+        node = root.host;
+      } else {
+        break;
+      }
+    }
+    return hosts;
   }
 
   function buildTargetInfo(el) {
@@ -253,6 +330,9 @@ const INJECTED_RECORDER_SCRIPT = `
       height: Math.round(rect.height),
     };
 
+    const shadowChain = shadowChainFor(el);
+    const domSnapshot = el.outerHTML ? el.outerHTML.slice(0, 1500) : undefined;
+
     return {
       tagName,
       role,
@@ -261,6 +341,8 @@ const INJECTED_RECORDER_SCRIPT = `
       attributes: Object.keys(attrs).length ? attrs : undefined,
       locators,
       boundingBox,
+      ...(shadowChain.length ? { shadowChain } : {}),
+      ...(domSnapshot ? { domSnapshot } : {}),
     };
   }
 
@@ -270,36 +352,81 @@ const INJECTED_RECORDER_SCRIPT = `
     }
   }
 
-  // 1. 点击事件（忽略回车触发表单的 0 尺寸隐藏按钮合成点击）
+  // 0. 悬停：驻留 450ms 才记录，避免鼠标划过产生噪声
+  let hoverTimer = null;
+  let lastHoverEl = null;
+  function cancelHover() {
+    if (hoverTimer) {
+      clearTimeout(hoverTimer);
+      hoverTimer = null;
+    }
+  }
+  document.addEventListener('mouseover', (e) => {
+    if (!e.isTrusted) return;
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+    cancelHover();
+    hoverTimer = setTimeout(() => {
+      hoverTimer = null;
+      if (el === lastHoverEl) return;
+      const matched = el.closest('button, a, [role="button"], [role="menuitem"], [role="tab"], [role="link"], [data-testid], li, label');
+      const style = window.getComputedStyle(el);
+      const cursorPointer = style && style.cursor === 'pointer';
+      if (!matched && !cursorPointer) return;
+      const hoverable = matched || el;
+      if (hoverable === document.body || hoverable === document.documentElement) return;
+      lastHoverEl = el;
+      const targetInfo = buildTargetInfo(hoverable);
+      if (!targetInfo) return;
+      sendEvent({ actionType: 'hover', target: targetInfo });
+    }, 450);
+  }, true);
+
+  // 1. 点击：立即上报（避免导航卸载打断上报）；双击由主进程把最后一条 click 替换为 dblclick
   document.addEventListener('click', (e) => {
     if (!e.isTrusted) return;
     const rawEl = e.target;
     if (!(rawEl instanceof Element)) return;
+    if (e.detail >= 2) return;
+    cancelHover();
     const interactive = rawEl.closest('button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], label') || rawEl;
     const targetInfo = buildTargetInfo(interactive);
     if (e.detail === 0 && targetInfo?.boundingBox && targetInfo.boundingBox.width === 0 && targetInfo.boundingBox.height === 0) {
       return;
     }
-    sendEvent({
-      actionType: 'click',
-      target: targetInfo,
-    });
+    sendEvent({ actionType: 'click', target: targetInfo });
   }, true);
 
-  // 2. 输入框与下拉选择变更
+  document.addEventListener('dblclick', (e) => {
+    if (!e.isTrusted) return;
+    cancelHover();
+    const rawEl = e.target;
+    if (!(rawEl instanceof Element)) return;
+    const interactive = rawEl.closest('button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], label, [contenteditable="true"]') || rawEl;
+    sendEvent({ actionType: 'dblclick', target: buildTargetInfo(interactive) });
+  }, true);
+
+  // 2. 输入框 / 富文本编辑区变更（文件上传单独由 change 事件记录）
   document.addEventListener('input', (e) => {
     if (!e.isTrusted) return;
     const el = e.target;
     if (!(el instanceof HTMLElement)) return;
+    cancelHover();
     const tag = el.tagName.toLowerCase();
     if (tag === 'input' || tag === 'textarea') {
       const inputEl = el;
-      if (['checkbox', 'radio', 'button', 'submit'].includes(inputEl.type)) return;
+      if (['checkbox', 'radio', 'button', 'submit', 'file'].includes(inputEl.type)) return;
       const isPassword = inputEl.type === 'password';
       sendEvent({
         actionType: 'fill',
         value: isPassword ? '******' : inputEl.value,
         target: buildTargetInfo(inputEl),
+      });
+    } else if (el.isContentEditable) {
+      sendEvent({
+        actionType: 'fill',
+        value: (el.innerText || '').slice(0, 2000),
+        target: buildTargetInfo(el),
       });
     }
   }, true);
@@ -314,26 +441,98 @@ const INJECTED_RECORDER_SCRIPT = `
         value: el.value,
         target: buildTargetInfo(el),
       });
-    }
-  }, true);
-
-  // 3. 关键按键事件 (Enter / Escape)
-  document.addEventListener('keydown', (e) => {
-    if (!e.isTrusted) return;
-    if (['Enter', 'Escape'].includes(e.key)) {
-      const el = e.target instanceof Element ? e.target : document.activeElement;
+    } else if (el instanceof HTMLInputElement && el.type === 'file') {
+      const files = Array.from(el.files || []).map((file) => file.name).join(', ');
       sendEvent({
-        actionType: 'press',
-        key: e.key,
-        value: e.key,
-        target: el ? buildTargetInfo(el) : undefined,
+        actionType: 'file_upload',
+        value: files,
+        target: buildTargetInfo(el),
       });
     }
   }, true);
 
-  // 4. 选中页面文本事件
+  // 3. 关键按键事件（Enter / Escape / Tab / 方向键）
+  document.addEventListener('keydown', (e) => {
+    if (!e.isTrusted) return;
+    const trackedKeys = ['Enter', 'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+    if (!trackedKeys.includes(e.key)) return;
+    cancelHover();
+    const el = e.target instanceof Element ? e.target : document.activeElement;
+    const tag = el && el.tagName ? el.tagName.toLowerCase() : '';
+    const isTypingField = tag === 'input' || tag === 'textarea' || (el && el.isContentEditable);
+    // 输入框内的可打印字符由 input 事件以 fill 记录，这里只保留提交/取消/导航类按键
+    if (isTypingField && !['Enter', 'Escape', 'Tab'].includes(e.key)) return;
+    sendEvent({
+      actionType: 'press',
+      key: e.key,
+      value: e.key,
+      target: el ? buildTargetInfo(el) : undefined,
+    });
+  }, true);
+
+  // 4. 右键菜单
+  document.addEventListener('contextmenu', (e) => {
+    if (!e.isTrusted) return;
+    cancelHover();
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+    const interactive = el.closest('button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="tab"], label, [contenteditable="true"]') || el;
+    sendEvent({ actionType: 'contextmenu', target: buildTargetInfo(interactive) });
+  }, true);
+
+  // 5. 拖拽：dragstart 记录源，drop 记录目标，合并为一条 drag
+  let dragSource = null;
+  let lastDragAt = 0;
+  document.addEventListener('dragstart', (e) => {
+    if (!e.isTrusted) return;
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+    dragSource = buildTargetInfo(el.closest('[draggable="true"], [draggable]') || el);
+  }, true);
+  document.addEventListener('drop', (e) => {
+    if (!e.isTrusted) return;
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el || !dragSource) return;
+    const dropTarget = buildTargetInfo(el.closest('[data-drop], [role="listitem"], li, div') || el);
+    sendEvent({ actionType: 'drag', target: dragSource, dragTo: dropTarget });
+    dragSource = null;
+  }, true);
+  document.addEventListener('dragend', () => {
+    dragSource = null;
+    lastDragAt = Date.now();
+  }, true);
+
+  // 6. 滚动：仅主文档、节流 350ms、位移 >= 200px 才记录（作为轨迹证据）
+  if (window.top === window) {
+    let lastScrollX = window.scrollX;
+    let lastScrollY = window.scrollY;
+    let scrollTimer = null;
+    window.addEventListener('scroll', () => {
+      if (scrollTimer) clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => {
+        scrollTimer = null;
+        const dx = Math.abs(window.scrollX - lastScrollX);
+        const dy = Math.abs(window.scrollY - lastScrollY);
+        if (dx + dy < 200) return;
+        lastScrollX = window.scrollX;
+        lastScrollY = window.scrollY;
+        sendEvent({ actionType: 'scroll', value: window.scrollX + ',' + window.scrollY });
+      }, 350);
+    }, true);
+  }
+
+  // 7. 选中页面文本事件（仅真正的拖选：左键按下后位移 > 20px，忽略右键/拖拽残留）
+  let lastMouseDown = { x: 0, y: 0 };
+  document.addEventListener('mousedown', (e) => {
+    if (!e.isTrusted || e.button !== 0) return;
+    lastMouseDown = { x: e.clientX, y: e.clientY };
+  }, true);
   document.addEventListener('mouseup', (e) => {
     if (!e.isTrusted) return;
+    if (e.button !== 0) return;
+    if (dragSource || Date.now() - lastDragAt < 300) return;
+    const moved = Math.hypot(e.clientX - lastMouseDown.x, e.clientY - lastMouseDown.y);
+    if (moved < 20) return;
     const sel = window.getSelection();
     const selectedText = sel ? sel.toString().trim() : '';
     if (selectedText && selectedText.length >= 2) {
@@ -376,6 +575,68 @@ function attachPageLifecycleListeners(context: BrowserContext, page: Page, isIni
     const trace = appendRecordedEvent(projectId, event)
     notifyTraceListeners(projectId, trace, event)
   }
+
+  // 监听原生弹窗：录制时记录并接受（受控浏览器下无法让用户真实选择，见文档说明）
+  page.on('dialog', async (dialog) => {
+    if (!activeRecordingProjectId) {
+      await dialog.dismiss().catch(() => {})
+      return
+    }
+    const projectId = activeRecordingProjectId
+    const now = Date.now()
+    const event: RecordedEvent = {
+      id: `evt-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      timestamp: now,
+      isoTime: new Date(now).toISOString(),
+      pageContext: {
+        tabId: getOrAssignTabId(page),
+        tabIndex: getTabIndex(context, page),
+        url: page.url(),
+        title: '原生弹窗',
+      },
+      action: {
+        category: 'page',
+        type: 'dialog',
+        value: `${dialog.type()}:${dialog.message().slice(0, 200)}`,
+      },
+    }
+    try {
+      const trace = appendRecordedEvent(projectId, event)
+      notifyTraceListeners(projectId, trace, event)
+    } catch {
+      // 忽略记录失败，保证弹窗不阻塞
+    }
+    await dialog.accept().catch(() => {})
+  })
+
+  // 监听下载：作为轨迹证据记录（回放时点击本身会重新触发下载）
+  page.on('download', (download) => {
+    if (!activeRecordingProjectId) return
+    const projectId = activeRecordingProjectId
+    const now = Date.now()
+    const event: RecordedEvent = {
+      id: `evt-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      timestamp: now,
+      isoTime: new Date(now).toISOString(),
+      pageContext: {
+        tabId: getOrAssignTabId(page),
+        tabIndex: getTabIndex(context, page),
+        url: page.url(),
+        title: '文件下载',
+      },
+      action: {
+        category: 'page',
+        type: 'download',
+        value: `${download.suggestedFilename()} ${download.url()}`.slice(0, 300),
+      },
+    }
+    try {
+      const trace = appendRecordedEvent(projectId, event)
+      notifyTraceListeners(projectId, trace, event)
+    } catch {
+      // 忽略
+    }
+  })
 
   // 监听主框架 URL 导航变化
   let lastRecordedUrl = page.url()
@@ -455,10 +716,22 @@ async function ensureContextInstrumented(context: BrowserContext) {
     async (
       source,
       payload: {
-        actionType: 'click' | 'fill' | 'select' | 'select_text' | 'press'
+        actionType:
+          | 'click'
+          | 'dblclick'
+          | 'contextmenu'
+          | 'hover'
+          | 'drag'
+          | 'scroll'
+          | 'fill'
+          | 'select'
+          | 'select_text'
+          | 'file_upload'
+          | 'press'
         value?: string
         key?: string
         target?: RecordedEvent['target']
+        dragTo?: RecordedEvent['target']
       }
     ) => {
       if (!activeRecordingProjectId) return
@@ -470,6 +743,16 @@ async function ensureContextInstrumented(context: BrowserContext) {
       const pageUrl = page.url()
       const pageTitle = await page.title().catch(() => '')
       const frameUrl = frame !== page.mainFrame() ? frame.url() : undefined
+      const frameChain = buildFrameChain(frame)
+      const viewport = await page
+        .evaluate(() => ({
+          width: window.innerWidth,
+          height: window.innerHeight,
+          dpr: window.devicePixelRatio,
+          scrollX: window.scrollX,
+          scrollY: window.scrollY,
+        }))
+        .catch(() => undefined)
 
       const screenshotPath = await captureSnapshot(projectId, eventId, page)
 
@@ -483,6 +766,8 @@ async function ensureContextInstrumented(context: BrowserContext) {
           url: pageUrl,
           title: pageTitle,
           frameUrl,
+          ...(frameChain.length > 0 ? { frameChain } : {}),
+          ...(viewport ? { viewport } : {}),
         },
         action: {
           category: 'page',
@@ -491,10 +776,14 @@ async function ensureContextInstrumented(context: BrowserContext) {
           key: payload.key,
         },
         target: payload.target,
+        ...(payload.dragTo ? { dragTo: payload.dragTo } : {}),
         screenshotPath,
       }
 
-      const trace = appendRecordedEvent(projectId, event)
+      const trace =
+        payload.actionType === 'dblclick'
+          ? replaceTrailingClickWithDblclick(projectId, event)
+          : appendRecordedEvent(projectId, event)
       notifyTraceListeners(projectId, trace, event)
     }
   )
@@ -532,6 +821,7 @@ export async function getPersistentBrowserContext(headless = false): Promise<Bro
 
   persistentContext = await chromium.launchPersistentContext(BROWSER_PROFILE_DIR, {
     headless,
+    acceptDownloads: true,
     ...(localExecPath ? { executablePath: localExecPath } : { channel: 'chrome' }),
     viewport: null,
     args: ['--start-maximized'],
@@ -575,6 +865,8 @@ export async function openRecordingBrowser(projectId: string): Promise<{ pageUrl
  */
 export async function stopRecordingBrowser(): Promise<void> {
   activeRecordingProjectId = null
+  // 给在途的录制回调（截图/事件落库）留出提交时间，避免停止瞬间丢事件
+  await new Promise((resolve) => setTimeout(resolve, 350))
   if (persistentContext) {
     await persistentContext.close()
     persistentContext = null
@@ -589,28 +881,1051 @@ export function getActiveRecordingProjectId(): string | null {
 /**
  * 按候选选择器优先级依次尝试定位元素
  */
-async function resolveLocator(page: Page, locators: CandidateLocator[], timeoutMs: number) {
+/**
+ * 按候选选择器优先级依次尝试定位元素；命中后返回定位器与策略，供执行遥测使用
+ */
+interface ResolvedTarget {
+  locator: Locator
+  strategy: LocatorStrategy
+  value: string
+  tier: 'L1' | 'L2'
+  matchedVia?: string
+}
+
+interface DerivedAttempt {
+  strategy: LocatorStrategy
+  value: string
+  via: string
+}
+
+function buildLocator(scope: Page | Frame, loc: CandidateLocator): Locator {
+  if (loc.strategy === 'testId') return scope.getByTestId(loc.value)
+  if (loc.strategy === 'label') return scope.getByLabel(loc.value)
+  if (loc.strategy === 'text') return scope.getByText(loc.value)
+  if (loc.strategy === 'role') {
+    // 录制端把 role 存成 `role:可访问名称`（如 button:搜索），这里拆开走 getByRole
+    const sep = loc.value.indexOf(':')
+    const roleName = sep === -1 ? loc.value : loc.value.slice(0, sep)
+    const roleText = sep === -1 ? '' : loc.value.slice(sep + 1)
+    return scope.getByRole(
+      roleName as Parameters<Page['getByRole']>[0],
+      roleText ? { name: roleText } : undefined
+    )
+  }
+  return scope.locator(loc.value)
+}
+
+/**
+ * 用录制证据做元素身份校验：标签名、文本、href 任一不符就拒绝该候选。
+ * 真实站点上「label/text」类候选经常命中无关元素（例：Submit 按钮的 label 证据误指向单选框），
+ * 仅按候选顺序盲选会点错，必须用 evidence 复核。
+ */
+async function elementMatchesRecovery(locator: Locator, recovery?: StepRecovery): Promise<boolean> {
+  if (!recovery) return true
+  try {
+    const info = await locator.evaluate((el) => {
+      const element = el as HTMLElement
+      const text = (element.innerText || element.getAttribute('aria-label') || '')
+        .trim()
+        .replace(/\s+/g, ' ')
+      return {
+        tag: element.tagName ? element.tagName.toLowerCase() : '',
+        text,
+        href: (el as HTMLAnchorElement).href || '',
+      }
+    })
+    if (recovery.tagName && info.tag && info.tag !== recovery.tagName) return false
+    const expectedText = (recovery.innerText || '').trim().replace(/\s+/g, ' ')
+    if (expectedText) {
+      const sample = expectedText.slice(0, 40)
+      const actual = info.text.slice(0, 120)
+      if (!actual.includes(sample) && !sample.includes(actual.slice(0, 20))) return false
+    }
+    if (recovery.attributes?.href && info.href) {
+      const expectedHref = recovery.attributes.href
+      if (!info.href.includes(expectedHref) && !expectedHref.includes(info.href)) return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 并行尝试候选定位器（不抛错）；总耗时 ≈ 单个超时，而不是候选数 × 超时 */
+async function tryLocatorCandidates(
+  scope: Page | Frame,
+  locators: CandidateLocator[],
+  timeoutMs: number,
+  recovery?: StepRecovery
+): Promise<{ locator: Locator; strategy: LocatorStrategy; value: string } | null> {
   const sorted = [...locators].sort((a, b) => a.priority - b.priority)
+  if (sorted.length === 0) return null
 
-  for (const loc of sorted) {
+  const perTimeout = Math.min(timeoutMs, 2500)
+  const attempts = sorted.map(async (loc) => {
     try {
-      const target =
-        loc.strategy === 'testId'
-          ? page.getByTestId(loc.value)
-          : loc.strategy === 'label'
-            ? page.getByLabel(loc.value)
-            : loc.strategy === 'text'
-              ? page.getByText(loc.value)
-              : page.locator(loc.value)
-
-      await target.first().waitFor({ state: 'visible', timeout: Math.min(timeoutMs, 3500) })
-      return target.first()
+      const target = buildLocator(scope, loc)
+      await target.first().waitFor({ state: 'visible', timeout: perTimeout })
+      if (await elementMatchesRecovery(target.first(), recovery)) {
+        return { locator: target.first(), strategy: loc.strategy, value: loc.value }
+      }
+      // 同一选择器命中多个元素时，逐个校验身份（最多 3 个），避免点到同构但无关的元素
+      const count = await target.count().catch(() => 0)
+      for (let index = 1; index < Math.min(count, 3); index += 1) {
+        const candidate = target.nth(index)
+        await candidate.waitFor({ state: 'visible', timeout: 600 }).catch(() => {})
+        if (await elementMatchesRecovery(candidate, recovery)) {
+          return { locator: candidate, strategy: loc.strategy, value: loc.value }
+        }
+      }
+      return null
     } catch {
-      // 当前选择器未命中，继续尝试下一个候选选择器
+      return null
+    }
+  })
+
+  const matches = await Promise.all(attempts)
+  return matches.find((match) => match !== null) ?? null
+}
+
+/** L1：录制定位器直接命中（轨迹回放使用） */
+async function resolveLocator(
+  scope: Page | Frame,
+  locators: CandidateLocator[],
+  timeoutMs: number
+): Promise<{ locator: Locator; strategy: LocatorStrategy; value: string }> {
+  const matched = await tryLocatorCandidates(scope, locators, timeoutMs)
+  if (matched) return matched
+  throw new Error(`未找到目标元素 (${locators.map((l) => l.value).join(', ')})`)
+}
+
+function escapeAttrValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+/** 从录制的 outerHTML 片段提取候选（L2 兜底） */
+function deriveSnapshotAttempts(snapshot: string): DerivedAttempt[] {
+  const attempts: DerivedAttempt[] = []
+  const tagMatch = snapshot.match(/^<\s*([a-zA-Z][\w-]*)/)
+  const tag = tagMatch ? tagMatch[1].toLowerCase() : '*'
+  const attrNames = ['data-testid', 'data-test', 'id', 'name', 'aria-label', 'placeholder', 'title']
+
+  for (const attr of attrNames) {
+    const match = snapshot.match(new RegExp(`${attr.replace('-', '\\-')}="([^"]{1,80})"`))
+    if (!match) continue
+    const value = match[1]
+    if (attr === 'id' && /^[0-9]+$/.test(value)) continue
+    attempts.push({
+      strategy: 'css',
+      value: `${tag}[${attr}="${escapeAttrValue(value)}"]`,
+      via: `DOM 快照 ${attr}`,
+    })
+  }
+
+  const textMatch = snapshot.match(/>\s*([^<>{}]{2,40}?)\s*</)
+  if (textMatch) attempts.push({ strategy: 'text', value: textMatch[1].trim(), via: 'DOM 快照文本' })
+  return attempts
+}
+
+/** L2：用结构证据并行恢复目标（shadow 链 / 邻近锚点 / DOM 快照） */
+async function tryRecoveryTargets(
+  scope: Page | Frame,
+  recovery: NonNullable<OperationWorkflow['steps'][number]['engineBinding']['recovery']>,
+  locators: CandidateLocator[],
+  timeoutMs: number
+): Promise<ResolvedTarget | null> {
+  interface RecoveryAttempt extends DerivedAttempt {
+    timeoutMs: number
+  }
+
+  const attempts: RecoveryAttempt[] = []
+
+  // L2-a：shadow host 链 + 计划内 CSS（Playwright `>>` 可穿透 open shadow DOM）
+  if (recovery.shadowChain?.length) {
+    for (const loc of locators.filter((item) => item.strategy === 'css')) {
+      attempts.push({
+        strategy: 'css',
+        value: [...recovery.shadowChain, loc.value].join(' >> '),
+        via: 'shadow host 链',
+        timeoutMs: 900,
+      })
     }
   }
 
-  throw new Error(`未找到目标元素 (${locators.map((l) => l.value).join(', ')})`)
+  // L2-b：邻近锚点 / 角色 / 文本 / DOM 快照
+  const name = recovery.innerText || recovery.nearbyText
+  if (recovery.role && name) {
+    attempts.push({ strategy: 'role', value: `${recovery.role}:${name}`, via: '邻近锚点 role', timeoutMs: 1200 })
+  }
+  if (recovery.innerText && recovery.innerText.length >= 2 && recovery.innerText.length <= 40) {
+    attempts.push({ strategy: 'text', value: recovery.innerText, via: '文本锚点', timeoutMs: 1200 })
+  }
+  if (recovery.nearbyText) {
+    attempts.push({ strategy: 'label', value: recovery.nearbyText, via: '邻近文字', timeoutMs: 1200 })
+  }
+  if (recovery.domSnapshot) {
+    attempts.push(
+      ...deriveSnapshotAttempts(recovery.domSnapshot).map((attempt) => ({ ...attempt, timeoutMs: 1200 }))
+    )
+  }
+  if (attempts.length === 0) return null
+
+  const results = await Promise.all(
+    attempts.map(async (attempt) => {
+      try {
+        const target = buildLocator(scope, {
+          strategy: attempt.strategy,
+          value: attempt.value,
+          priority: 1,
+        })
+        await target
+          .first()
+          .waitFor({ state: 'visible', timeout: Math.min(timeoutMs, attempt.timeoutMs) })
+        return {
+          locator: target.first(),
+          strategy: attempt.strategy,
+          value: attempt.value,
+          tier: 'L2' as const,
+          matchedVia: attempt.via,
+        }
+      } catch {
+        return null
+      }
+    })
+  )
+
+  // 按候选优先级取第一个命中（而不是按响应先后）
+  return results.find((result) => result !== null) ?? null
+}
+
+/** 先走 L1 录制定位器，失败再走 L2 结构证据恢复 */
+async function resolveLocatorWithRecovery(
+  scope: Page | Frame,
+  step: OperationWorkflow['steps'][number],
+  timeoutMs: number
+): Promise<ResolvedTarget> {
+  const direct = await tryLocatorCandidates(
+    scope,
+    step.engineBinding.locators,
+    timeoutMs,
+    step.engineBinding.recovery
+  )
+  if (direct) return { ...direct, tier: 'L1' }
+
+  const recovery = step.engineBinding.recovery
+  if (recovery) {
+    const recovered = await tryRecoveryTargets(scope, recovery, step.engineBinding.locators, timeoutMs)
+    if (recovered) return recovered
+  }
+
+  throw new Error(
+    `未找到目标元素（L1 候选 ${step.engineBinding.locators.length} 个；L2 结构恢复失败）`
+  )
+}
+
+function urlMatches(actual: string, expected: string): boolean {
+  if (!actual || actual === 'about:blank') return false
+  return actual === expected || actual.includes(expected) || expected.includes(actual)
+}
+
+function matchFrameChain(page: Page, chain: FrameRef[]): Frame | null {
+  const mainFrame = page.mainFrame()
+  const target = chain[chain.length - 1]
+  const frames = page.frames().filter((frame) => frame !== mainFrame)
+
+  for (const frame of frames) {
+    if (!urlMatches(frame.url(), target.url)) continue
+    let current: Frame = frame
+    let ok = true
+    for (let i = chain.length - 2; i >= 0; i -= 1) {
+      const parent = current.parentFrame()
+      if (!parent || parent === mainFrame || !urlMatches(parent.url(), chain[i].url)) {
+        ok = false
+        break
+      }
+      current = parent
+    }
+    if (ok) return frame
+  }
+  return null
+}
+
+/** 动作执行作用域：按 frameChain（或单层 frameUrl）找到目标 iframe */
+async function resolveActionScope(
+  page: Page,
+  binding: { frameUrl?: string; frameChain?: FrameRef[] },
+  timeoutMs: number
+): Promise<Page | Frame> {
+  const chain: FrameRef[] = binding.frameChain?.length
+    ? binding.frameChain
+    : binding.frameUrl
+      ? [{ url: binding.frameUrl }]
+      : []
+  if (chain.length === 0) return page
+
+  const deadline = Date.now() + Math.min(Math.max(timeoutMs, 2000), 8000)
+  while (Date.now() < deadline) {
+    const matched = matchFrameChain(page, chain)
+    if (matched) return matched
+    await page.waitForTimeout(150)
+  }
+
+  throw new Error(`未找到 iframe（录制链：${chain.map((item) => item.url).join(' > ')}）`)
+}
+
+interface PageFingerprint {
+  url: string
+  textLength: number
+}
+
+/** 记录页面 URL 与当前作用域正文长度，用于判断动作是否产生了页面变化 */
+async function captureFingerprint(page: Page, scope: Page | Frame): Promise<PageFingerprint> {
+  const textLength = await scope
+    .evaluate(() => (document.body?.innerText || '').length)
+    .catch(() => -2)
+  return { url: page.url(), textLength }
+}
+
+/** 等待动作产生效果（URL 变化或正文长度变化），替代固定 sleep */
+async function waitForInteractionEffect(
+  page: Page,
+  scope: Page | Frame,
+  before: PageFingerprint,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (page.url() !== before.url) return true
+    const textLength = await scope
+      .evaluate(() => (document.body?.innerText || '').length)
+      .catch(() => -3)
+    if (textLength !== before.textLength) return true
+    await page.waitForTimeout(120)
+  }
+  return false
+}
+
+function normalizeUrlForCompare(value: string): string {
+  try {
+    const url = new URL(value)
+    const decoded = decodeURIComponent(`${url.origin}${url.pathname}${url.search}`)
+    return decoded.replace(/\+/g, ' ')
+  } catch {
+    try {
+      return decodeURIComponent(value).replace(/\+/g, ' ')
+    } catch {
+      return value
+    }
+  }
+}
+
+/**
+ * URL 模糊匹配：兼容编码差异（+ / %20）、参数顺序、末尾斜杠。
+ * 真实站点提交后 URL 常与录制时编码不一致，严格 includes 会误判失败。
+ */
+function urlMatchesExpected(actual: string, expected: string): boolean {
+  if (!actual || actual === 'about:blank') return false
+  if (actual === expected || actual.includes(expected)) return true
+
+  const normalizedActual = normalizeUrlForCompare(actual)
+  const normalizedExpected = normalizeUrlForCompare(expected)
+  if (normalizedActual.includes(normalizedExpected)) return true
+
+  try {
+    const actualUrl = new URL(actual)
+    const expectedUrl = new URL(expected)
+    if (actualUrl.origin !== expectedUrl.origin) return false
+    if (actualUrl.pathname.replace(/\/$/, '') !== expectedUrl.pathname.replace(/\/$/, '')) return false
+    for (const [key, value] of expectedUrl.searchParams) {
+      if (actualUrl.searchParams.get(key) !== value) return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function waitForUrlContains(
+  page: Page,
+  expected: string,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (urlMatchesExpected(page.url(), expected)) return true
+    await page.waitForTimeout(150)
+  }
+  return urlMatchesExpected(page.url(), expected)
+}
+
+async function waitForTitleContains(
+  page: Page,
+  expected: string,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const title = await page.title().catch(() => '')
+    if (title.includes(expected)) return true
+    await page.waitForTimeout(150)
+  }
+  return (await page.title().catch(() => '')).includes(expected)
+}
+
+/** 校验失败即步骤失败：抛出后由主循环记录失败遥测并终止本次运行 */
+function assertStepVerified(verification: {
+  result: StepVerificationResult
+  detail?: string
+}): void {
+  if (verification.result === 'failed') {
+    throw new Error(`步骤校验失败：${verification.detail || '未通过'}`)
+  }
+}
+
+interface StepExecutionOutcome {
+  locatorStrategy?: LocatorStrategy
+  locatorValue?: string
+  tier?: 'L1' | 'L2' | 'L3'
+  matchedVia?: string
+  verification: StepVerificationResult
+  verificationDetail?: string
+}
+
+async function readElementValue(locator: Locator, timeoutMs: number): Promise<string> {
+  try {
+    return await locator.inputValue({ timeout: timeoutMs })
+  } catch {
+    try {
+      return (await locator.evaluate((el) => (el as HTMLElement).innerText ?? '')).trim()
+    } catch {
+      return ''
+    }
+  }
+}
+
+function resolveUploadPath(raw: string): string {
+  const candidates = [
+    raw,
+    path.resolve(process.cwd(), raw),
+    path.resolve(process.cwd(), 'data/uploads', raw),
+  ]
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate
+    } catch {
+      // 忽略不可访问的候选
+    }
+  }
+  return raw
+}
+
+/**
+ * 动作后置校验：显式规则优先；否则按 actionType 采用默认校验
+ */
+async function verifyStepOutcome(params: {
+  step: OperationWorkflow['steps'][number]
+  page: Page
+  scope: Page | Frame
+  resolved?: { locator: Locator; strategy: LocatorStrategy; value: string }
+  expectedValue?: string
+  effectChanged?: boolean
+}): Promise<{ result: StepVerificationResult; detail?: string }> {
+  const { step, page, scope, resolved, expectedValue, effectChanged } = params
+  const actionType = step.engineBinding.actionType
+  const rule = step.engineBinding.verification
+
+  // 1. 显式校验规则（翻译器或人工补全）
+  if (rule && rule.mode !== 'none') {
+    const timeoutMs = rule.timeoutMs || 4000
+    const expected = rule.expected !== undefined ? rule.expected : (expectedValue ?? '')
+    try {
+      if (rule.mode === 'url') {
+        const matched = await waitForUrlContains(page, expected, timeoutMs)
+        return matched
+          ? { result: 'verified', detail: `URL 含「${expected}」` }
+          : { result: 'failed', detail: `URL 未包含「${expected}」（当前 ${page.url()}）` }
+      }
+      if (rule.mode === 'title') {
+        const matched = await waitForTitleContains(page, expected, timeoutMs)
+        return matched
+          ? { result: 'verified', detail: `标题含「${expected}」` }
+          : { result: 'failed', detail: `标题未包含「${expected}」` }
+      }
+      if (rule.mode === 'text') {
+        await scope.getByText(expected).first().waitFor({ state: 'visible', timeout: timeoutMs })
+        return { result: 'verified', detail: `页面出现「${expected}」` }
+      }
+      if (rule.mode === 'value') {
+        if (!resolved) {
+          return { result: 'failed', detail: '没有可用于读取输入值的元素' }
+        }
+        const actual = await readElementValue(resolved.locator, timeoutMs)
+        return actual === expected
+          ? { result: 'verified', detail: `输入值 = 「${actual}」` }
+          : { result: 'failed', detail: `输入值「${actual}」≠ 期望「${expected}」` }
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '校验执行异常'
+      return { result: 'failed', detail: message }
+    }
+  }
+
+  // 2. 默认校验（不依赖翻译器）
+  if (actionType === 'fill' || actionType === 'select') {
+    if (!resolved) return { result: 'skipped' }
+    try {
+      const actual = await readElementValue(resolved.locator, 3000)
+      return actual === (expectedValue ?? '')
+        ? { result: 'verified', detail: `输入值 = 「${actual}」` }
+        : { result: 'failed', detail: `输入值「${actual}」≠ 期望「${expectedValue ?? ''}」` }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '读取输入值失败'
+      return { result: 'failed', detail: `无法读取输入值：${message}` }
+    }
+  }
+
+  if (actionType === 'file_upload') {
+    if (!resolved) return { result: 'skipped' }
+    try {
+      const names = await resolved.locator.evaluate((el) =>
+        Array.from((el as HTMLInputElement).files || []).map((file) => file.name)
+      )
+      const expectedName = expectedValue ? path.basename(expectedValue) : ''
+      if (names.length === 0) return { result: 'failed', detail: '文件未选择' }
+      if (expectedName && !names.includes(expectedName)) {
+        return { result: 'failed', detail: `已选文件「${names.join(', ')}」≠ 期望「${expectedName}」` }
+      }
+      return { result: 'verified', detail: `已选择文件：${names.join(', ')}` }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '读取文件失败'
+      return { result: 'failed', detail: `无法读取文件列表：${message}` }
+    }
+  }
+
+  if (actionType === 'goto') {
+    if (!page.url() || page.url() === 'about:blank') {
+      return { result: 'failed', detail: '页面仍停留在 about:blank' }
+    }
+    return { result: 'verified', detail: page.url() }
+  }
+
+  if (actionType === 'hover') {
+    return { result: 'skipped', detail: '悬停无强校验' }
+  }
+
+  if (
+    actionType === 'click' ||
+    actionType === 'contextmenu' ||
+    actionType === 'dblclick' ||
+    actionType === 'drag' ||
+    actionType === 'press'
+  ) {
+    return effectChanged
+      ? { result: 'verified', detail: '检测到页面变化' }
+      : { result: 'soft', detail: '未检测到页面变化（可能为幂等操作）' }
+  }
+
+  if (actionType === 'wait_for_text') {
+    return { result: 'verified', detail: '目标文本已出现' }
+  }
+
+  if (actionType === 'tab_open') {
+    return { result: 'verified', detail: '已打开新标签页' }
+  }
+
+  return { result: 'skipped' }
+}
+
+async function captureViewportScreenshot(page: Page): Promise<string> {
+  const buffer = await page.screenshot({ type: 'jpeg', quality: 60, timeout: 3000 })
+  return `data:image/jpeg;base64,${buffer.toString('base64')}`
+}
+
+function buildVisualInstruction(step: OperationWorkflow['steps'][number]): string {
+  const parts: string[] = []
+  if (step.humanView?.title) parts.push(`任务：${step.humanView.title}`)
+  if (step.humanView?.description) parts.push(`说明：${step.humanView.description}`)
+  const recovery = step.engineBinding.recovery
+  if (recovery?.innerText) parts.push(`目标文字：${recovery.innerText.slice(0, 40)}`)
+  if (recovery?.nearbyText) parts.push(`附近文字：${recovery.nearbyText.slice(0, 40)}`)
+  if (recovery?.role) parts.push(`元素角色：${recovery.role}`)
+  parts.push('请在截图中找到该目标元素，返回其归一化坐标（0~1）与置信度。')
+  return parts.join('；')
+}
+
+/**
+ * L3 视觉兜底：请求内网视觉 Agent 定位，再用坐标执行动作（仅 click/hover/fill 类）
+ */
+async function tryVisualFallback(params: {
+  page: Page
+  step: OperationWorkflow['steps'][number]
+  action: 'click' | 'dblclick' | 'contextmenu' | 'hover' | 'fill'
+  value?: string
+  expectedValue?: string
+  timeoutMs: number
+}): Promise<StepExecutionOutcome | null> {
+  const { page, step, action, value } = params
+  if (!canUseVisualAgent()) return null
+
+  const config = getVisualAgentConfig()
+  const [currentImage, viewport] = await Promise.all([
+    captureViewportScreenshot(page).catch(() => null),
+    page
+      .evaluate(() => ({
+        width: window.innerWidth,
+        height: window.innerHeight,
+        dpr: window.devicePixelRatio,
+        scrollX: window.scrollX,
+        scrollY: window.scrollY,
+      }))
+      .catch(() => null),
+  ])
+  if (!currentImage || !viewport) return null
+
+  const recovery = step.engineBinding.recovery
+  const result = await requestGrounding({
+    instruction: buildVisualInstruction(step),
+    currentImage,
+    referenceImage: loadScreenshotDataUrl(recovery?.referenceScreenshot),
+    viewport,
+    bboxHint: recovery?.bbox,
+  })
+  if (!result?.found || !result.point) return null
+
+  const confidence = Number(result.confidence ?? 0)
+  if (confidence < config.minConfidence) return null
+
+  const x = Math.round(result.point.x * viewport.width + viewport.scrollX)
+  const y = Math.round(result.point.y * viewport.height + viewport.scrollY)
+  if (x < 0 || y < 0) return null
+
+  const before = await captureFingerprint(page, page)
+  if (action === 'hover') {
+    await page.mouse.move(x, y)
+  } else if (action === 'dblclick') {
+    await page.mouse.dblclick(x, y)
+  } else if (action === 'contextmenu') {
+    await page.mouse.click(x, y, { button: 'right' })
+  } else if (action === 'fill') {
+    await page.mouse.click(x, y)
+    await page.keyboard.insertText(value ?? '')
+  } else {
+    await page.mouse.click(x, y)
+  }
+
+  const effectChanged =
+    action === 'fill' || action === 'hover'
+      ? false
+      : await waitForInteractionEffect(page, page, before, 1200)
+
+  const rule = step.engineBinding.verification
+  let verification: StepVerificationResult = 'skipped'
+  let verificationDetail = `视觉 Agent（${result.model ?? 'unknown'}）置信度 ${confidence.toFixed(2)}`
+
+  if (rule && rule.mode !== 'none') {
+    const ruleTimeout = rule.timeoutMs ?? 3000
+    const expected = rule.expected ?? params.expectedValue ?? ''
+    try {
+      if (rule.mode === 'text') {
+        await page.getByText(expected).first().waitFor({ state: 'visible', timeout: ruleTimeout })
+        verification = 'verified'
+        verificationDetail += `；页面出现「${expected}」`
+      } else if (rule.mode === 'url') {
+        const matched = await waitForUrlContains(page, expected, ruleTimeout)
+        verification = matched ? 'verified' : 'failed'
+        verificationDetail += matched ? `；URL 含「${expected}」` : `；URL 未匹配「${expected}」`
+      } else if (rule.mode === 'title') {
+        const matched = await waitForTitleContains(page, expected, ruleTimeout)
+        verification = matched ? 'verified' : 'failed'
+        verificationDetail += matched ? `；标题含「${expected}」` : `；标题未匹配「${expected}」`
+      } else {
+        verificationDetail += '；视觉兜底无法读取输入值，值校验跳过'
+      }
+    } catch (err) {
+      verification = 'failed'
+      const message = err instanceof Error ? err.message : '校验执行异常'
+      verificationDetail += `；校验失败：${message}`
+    }
+    assertStepVerified({ result: verification, detail: verificationDetail })
+  } else if (action === 'click' || action === 'dblclick' || action === 'contextmenu') {
+    verification = effectChanged ? 'verified' : 'soft'
+    verificationDetail += effectChanged ? '；检测到页面变化' : '；未检测到页面变化'
+  }
+
+  return {
+    tier: 'L3',
+    matchedVia: `视觉 Agent（${result.model ?? 'unknown'}，置信度 ${confidence.toFixed(2)}）`,
+    verification,
+    verificationDetail,
+  }
+}
+
+type ResolveOrVisualResult =
+  | { resolved: ResolvedTarget; visual?: undefined }
+  | { visual: StepExecutionOutcome; resolved?: undefined }
+
+/** 先走 L1/L2 定位，失败时按需触发 L3 视觉兜底 */
+async function resolveOrVisual(
+  page: Page,
+  scope: Page | Frame,
+  step: OperationWorkflow['steps'][number],
+  timeoutMs: number,
+  action: 'click' | 'dblclick' | 'contextmenu' | 'hover' | 'fill',
+  value?: string,
+  expectedValue?: string
+): Promise<ResolveOrVisualResult> {
+  try {
+    const resolved = await resolveLocatorWithRecovery(scope, step, timeoutMs)
+    return { resolved }
+  } catch (err) {
+    const visual = await tryVisualFallback({
+      page,
+      step,
+      action,
+      value,
+      expectedValue,
+      timeoutMs,
+    })
+    if (visual) return { visual }
+    throw err
+  }
+}
+
+/**
+ * 执行工作流中的单个步骤（按 actionType 分派），含 iframe 作用域与动作后置校验
+ */
+async function executeWorkflowStep(
+  context: BrowserContext,
+  tabMap: Map<string, Page>,
+  paramValues: Map<string, { label: string; value: string }>,
+  step: OperationWorkflow['steps'][number]
+): Promise<StepExecutionOutcome> {
+  const { tabId, actionType, locators, timeoutMs, frameUrl } = step.engineBinding
+  const paramKey = step.engineBinding.paramKey || step.humanView.paramKey
+  // 动态抽象步骤从参数表读取本次运行的值，固定步骤使用录制时的固定值
+  const resolvedParam = paramKey ? paramValues.get(paramKey)?.value : undefined
+  const value =
+    resolvedParam !== undefined ? resolvedParam : (step.engineBinding.value ?? '')
+
+  let page = tabMap.get(tabId)
+  if (!page || page.isClosed()) {
+    page = context.pages()[0] || (await context.newPage())
+    tabMap.set(tabId, page)
+  }
+
+  if (actionType === 'tab_open') {
+    const newPage = await context.newPage()
+    await newPage.bringToFront()
+    tabMap.set(tabId, newPage)
+    await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {})
+    return { verification: 'verified', verificationDetail: '已打开新标签页' }
+  }
+
+  if (actionType === 'tab_close') {
+    if (!page.isClosed() && context.pages().length > 1) {
+      await page.close()
+    }
+    return { verification: 'skipped' }
+  }
+
+  if (actionType === 'goto') {
+    await page.goto(value, { waitUntil: 'domcontentloaded', timeout: timeoutMs || 15000 })
+    // 显式等待网络空闲，替代固定 sleep
+    await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {})
+    return { verification: 'verified', verificationDetail: page.url() }
+  }
+
+  const scope = await resolveActionScope(
+    page,
+    { frameUrl, frameChain: step.engineBinding.frameChain },
+    timeoutMs
+  )
+  const expectedValue = value
+
+  if (actionType === 'contextmenu') {
+    const target = await resolveOrVisual(page, scope, step, timeoutMs, 'contextmenu')
+    if (target.visual) return target.visual
+    const resolved = target.resolved
+    const before = await captureFingerprint(page, scope)
+    await resolved.locator.click({ button: 'right', timeout: timeoutMs })
+    const effectChanged = await waitForInteractionEffect(page, scope, before, 900)
+    const verification = await verifyStepOutcome({
+      step, page, scope, resolved, expectedValue, effectChanged,
+    })
+    assertStepVerified(verification)
+    return {
+      locatorStrategy: resolved.strategy,
+      locatorValue: resolved.value,
+      tier: resolved.tier,
+      matchedVia: resolved.matchedVia,
+      verification: verification.result,
+      verificationDetail: verification.detail,
+    }
+  }
+
+  if (actionType === 'drag') {
+    const resolved = await resolveLocatorWithRecovery(scope, step, timeoutMs)
+    const dragTo = step.engineBinding.dragTo
+    if (!dragTo || dragTo.locators.length === 0) {
+      throw new Error('拖拽步骤缺少落点定位器')
+    }
+    const dropTarget = await tryLocatorCandidates(scope, dragTo.locators, timeoutMs)
+    if (!dropTarget) throw new Error('未找到拖拽落点元素')
+    const before = await captureFingerprint(page, scope)
+    await resolved.locator.dragTo(dropTarget.locator, { timeout: timeoutMs })
+    const effectChanged = await waitForInteractionEffect(page, scope, before, 1200)
+    const verification = await verifyStepOutcome({
+      step, page, scope, resolved, expectedValue, effectChanged,
+    })
+    assertStepVerified(verification)
+    return {
+      locatorStrategy: resolved.strategy,
+      locatorValue: resolved.value,
+      tier: resolved.tier,
+      matchedVia: resolved.matchedVia,
+      verification: verification.result,
+      verificationDetail: verification.detail,
+    }
+  }
+
+  if (actionType === 'scroll') {
+    const parts = (value || '0,0').split(',').map((part) => Number(part) || 0)
+    await page.evaluate(
+      ({ x, y }) => window.scrollTo(x, y),
+      { x: parts[0] ?? 0, y: parts[1] ?? 0 }
+    )
+    await page.waitForTimeout(250)
+    return { verification: 'skipped', verificationDetail: `滚动到 ${parts.join(',')}` }
+  }
+
+  if (actionType === 'dialog') {
+    await page.waitForTimeout(300)
+    return { verification: 'skipped', verificationDetail: '原生弹窗已由自动策略处理' }
+  }
+
+  if (actionType === 'hover') {
+    const target = await resolveOrVisual(page, scope, step, timeoutMs, 'hover')
+    if (target.visual) return target.visual
+    const resolved = target.resolved
+    await resolved.locator.hover({ timeout: timeoutMs })
+    await page.waitForTimeout(250)
+    return {
+      locatorStrategy: resolved.strategy,
+      locatorValue: resolved.value,
+      tier: resolved.tier,
+      matchedVia: resolved.matchedVia,
+      verification: 'skipped',
+      verificationDetail: '悬停无强校验',
+    }
+  }
+
+  if (actionType === 'dblclick') {
+    const target = await resolveOrVisual(page, scope, step, timeoutMs, 'dblclick')
+    if (target.visual) return target.visual
+    const resolved = target.resolved
+    const before = await captureFingerprint(page, scope)
+    await resolved.locator.dblclick({ timeout: timeoutMs })
+    const effectChanged = await waitForInteractionEffect(page, scope, before, 1200)
+    const verification = await verifyStepOutcome({
+      step, page, scope, resolved, expectedValue, effectChanged,
+    })
+    assertStepVerified(verification)
+    return {
+      locatorStrategy: resolved.strategy,
+      locatorValue: resolved.value,
+      tier: resolved.tier,
+      matchedVia: resolved.matchedVia,
+      verification: verification.result,
+      verificationDetail: verification.detail,
+    }
+  }
+
+  if (actionType === 'file_upload') {
+    const resolved = await resolveLocatorWithRecovery(scope, step, timeoutMs)
+    const uploadPath = resolveUploadPath(value)
+    await resolved.locator.setInputFiles(uploadPath, { timeout: timeoutMs })
+    const verification = await verifyStepOutcome({ step, page, scope, resolved, expectedValue })
+    assertStepVerified(verification)
+    return {
+      locatorStrategy: resolved.strategy,
+      locatorValue: resolved.value,
+      tier: resolved.tier,
+      matchedVia: resolved.matchedVia,
+      verification: verification.result,
+      verificationDetail: verification.detail,
+    }
+  }
+
+  if (actionType === 'click') {
+    const target = await resolveOrVisual(page, scope, step, timeoutMs, 'click')
+    if (target.visual) return target.visual
+    const resolved = target.resolved
+    const before = await captureFingerprint(page, scope)
+    await resolved.locator.click({ timeout: timeoutMs })
+    const effectChanged = await waitForInteractionEffect(page, scope, before, 1200)
+    const verification = await verifyStepOutcome({
+      step, page, scope, resolved, expectedValue, effectChanged,
+    })
+    assertStepVerified(verification)
+    return {
+      locatorStrategy: resolved.strategy,
+      locatorValue: resolved.value,
+      tier: resolved.tier,
+      matchedVia: resolved.matchedVia,
+      verification: verification.result,
+      verificationDetail: verification.detail,
+    }
+  }
+
+  if (actionType === 'fill') {
+    const target = await resolveOrVisual(page, scope, step, timeoutMs, 'fill', value, expectedValue)
+    if (target.visual) return target.visual
+    const resolved = target.resolved
+    await resolved.locator.fill(value, { timeout: timeoutMs })
+    const verification = await verifyStepOutcome({ step, page, scope, resolved, expectedValue })
+    assertStepVerified(verification)
+    return {
+      locatorStrategy: resolved.strategy,
+      locatorValue: resolved.value,
+      tier: resolved.tier,
+      matchedVia: resolved.matchedVia,
+      verification: verification.result,
+      verificationDetail: verification.detail,
+    }
+  }
+
+  if (actionType === 'select') {
+    const resolved = await resolveLocatorWithRecovery(scope, step, timeoutMs)
+    await resolved.locator.selectOption(value, { timeout: timeoutMs })
+    const verification = await verifyStepOutcome({ step, page, scope, resolved, expectedValue })
+    assertStepVerified(verification)
+    return {
+      locatorStrategy: resolved.strategy,
+      locatorValue: resolved.value,
+      tier: resolved.tier,
+      matchedVia: resolved.matchedVia,
+      verification: verification.result,
+      verificationDetail: verification.detail,
+    }
+  }
+
+  if (actionType === 'press') {
+    const pressKey = value || 'Enter'
+
+    // 焦点在可输入元素上时，键盘按键语义等价；真实站点重渲染导致元素瞬时不可用时用此兜底
+    const focusedEditable = async (): Promise<boolean> =>
+      page
+        .evaluate(() => {
+          const element = document.activeElement as HTMLElement | null
+          if (!element) return false
+          const tag = element.tagName
+          return tag === 'INPUT' || tag === 'TEXTAREA' || element.isContentEditable
+        })
+        .catch(() => false)
+
+    if (locators && locators.length > 0) {
+      let resolved: ResolvedTarget | undefined
+      let matchedVia: string | undefined
+      try {
+        resolved = await resolveLocatorWithRecovery(scope, step, timeoutMs)
+        const before = await captureFingerprint(page, scope)
+        await resolved.locator.press(pressKey, { timeout: Math.min(timeoutMs, 4000) })
+        const effectChanged = await waitForInteractionEffect(page, scope, before, 2500)
+        const verification = await verifyStepOutcome({
+          step, page, scope, resolved, expectedValue, effectChanged,
+        })
+        assertStepVerified(verification)
+        return {
+          locatorStrategy: resolved.strategy,
+          locatorValue: resolved.value,
+          tier: resolved.tier,
+          matchedVia: resolved.matchedVia,
+          verification: verification.result,
+          verificationDetail: verification.detail,
+        }
+      } catch (err) {
+        if (!(await focusedEditable())) throw err
+        matchedVia = '按键瞬间目标不可用，使用焦点键盘兜底'
+      }
+
+      const before = await captureFingerprint(page, page)
+      await page.keyboard.press(pressKey)
+      const effectChanged = await waitForInteractionEffect(page, page, before, 2500)
+      const verification = await verifyStepOutcome({ step, page, scope, resolved, expectedValue, effectChanged })
+      assertStepVerified(verification)
+      return {
+        locatorStrategy: resolved?.strategy,
+        locatorValue: resolved?.value,
+        tier: resolved?.tier,
+        matchedVia,
+        verification: verification.result,
+        verificationDetail: verification.detail,
+      }
+    }
+
+    const before = await captureFingerprint(page, page)
+    await page.keyboard.press(pressKey)
+    const effectChanged = await waitForInteractionEffect(page, page, before, 2500)
+    const verification = await verifyStepOutcome({ step, page, scope, expectedValue, effectChanged })
+    assertStepVerified(verification)
+    return { verification: verification.result, verificationDetail: verification.detail }
+  }
+
+  if (actionType === 'extract_text' && value) {
+    await page
+      .evaluate((textToSelect) => {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+        let node: Node | null
+        while ((node = walker.nextNode())) {
+          const content = node.textContent || ''
+          const idx = content.indexOf(textToSelect)
+          if (idx !== -1) {
+            const range = document.createRange()
+            range.setStart(node, idx)
+            range.setEnd(node, idx + textToSelect.length)
+            const sel = window.getSelection()
+            sel?.removeAllRanges()
+            sel?.addRange(range)
+            break
+          }
+        }
+      }, value)
+      .catch(() => {})
+    return { verification: 'skipped' }
+  }
+
+  if (actionType === 'wait_for_text' && value) {
+    await scope.getByText(value).first().waitFor({ state: 'visible', timeout: timeoutMs })
+    return { verification: 'verified', verificationDetail: '目标文本已出现' }
+  }
+
+  return { verification: 'skipped' }
+}
+
+/** 失败时抓取现场截图，供人工排查与后续告警 */
+async function captureFailureArtifact(
+  context: BrowserContext | null
+): Promise<{ screenshotPath: string; pageUrl: string } | undefined> {
+  if (!context) return undefined
+  const page = context.pages().find((candidate) => !candidate.isClosed())
+  if (!page) return undefined
+  try {
+    const dir = path.join(SCREENSHOTS_DIR, 'failures')
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    const fileName = `${Date.now()}.jpg`
+    await page.screenshot({
+      path: path.join(dir, fileName),
+      type: 'jpeg',
+      quality: 60,
+      timeout: 2000,
+    })
+    return {
+      screenshotPath: `data/screenshots/failures/${fileName}`,
+      pageUrl: page.url(),
+    }
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -618,7 +1933,8 @@ async function resolveLocator(page: Page, locators: CandidateLocator[], timeoutM
  */
 async function executeCompiledWorkflow(
   workflow: OperationWorkflow,
-  runtimeParams?: Record<string, string>
+  runtimeParams?: Record<string, string>,
+  options: RunOptions = {}
 ): Promise<RunRecord> {
   const startedAt = Date.now()
   activeRecordingProjectId = null
@@ -632,8 +1948,12 @@ async function executeCompiledWorkflow(
     })
   }
 
+  const logs: StepExecutionLog[] = []
+  const totalSteps = workflow.steps.length
+  let context: BrowserContext | null = null
+
   try {
-    const context = await getPersistentBrowserContext(false)
+    context = await getPersistentBrowserContext(false)
     const initialPage = context.pages()[0] || (await context.newPage())
     await initialPage.bringToFront()
 
@@ -641,101 +1961,77 @@ async function executeCompiledWorkflow(
     const firstTabId = workflow.steps[0]?.engineBinding.tabId || 'tab-1'
     tabMap.set(firstTabId, initialPage)
 
-    for (const step of workflow.steps) {
-      const { tabId, actionType, locators, timeoutMs } = step.engineBinding
-      const paramKey = step.engineBinding.paramKey || step.humanView.paramKey
-      // 如果是动态抽象步骤，从项目参数表中读取对应参数值；否则使用固定值
-      const resolvedParam = paramKey ? paramValues.get(paramKey)?.value : undefined
-      const value =
-        resolvedParam !== undefined
-          ? resolvedParam
-          : (step.engineBinding.value ?? '')
-
-      let page = tabMap.get(tabId)
-      if (!page || page.isClosed()) {
-        page = context.pages()[0] || (await context.newPage())
-        tabMap.set(tabId, page)
+    // 录制时原生弹窗被自动接受；回放时若工作流包含 dialog 步骤，同样采用自动接受策略
+    const hasDialogSteps = workflow.steps.some(
+      (step) => step.engineBinding.actionType === 'dialog'
+    )
+    if (hasDialogSteps) {
+      const acceptDialog = (targetPage: Page) => {
+        targetPage.on('dialog', (dialog) => {
+          void dialog.accept().catch(() => {})
+        })
       }
+      for (const existingPage of context.pages()) acceptDialog(existingPage)
+      context.on('page', acceptDialog)
+    }
 
-      if (actionType === 'tab_open') {
-        const newPage = await context.newPage()
-        await newPage.bringToFront()
-        tabMap.set(tabId, newPage)
-        continue
-      }
-
-      if (actionType === 'tab_close') {
-        if (!page.isClosed() && context.pages().length > 1) {
-          await page.close()
-        }
-        continue
-      }
-
-      if (actionType === 'goto') {
-        await page.goto(value, { waitUntil: 'domcontentloaded', timeout: timeoutMs || 15000 })
-        await page.waitForTimeout(400)
-        continue
-      }
-
-      if (actionType === 'click') {
-        const el = await resolveLocator(page, locators, timeoutMs)
-        await el.click({ timeout: timeoutMs })
-        await page.waitForTimeout(350)
-        continue
-      }
-
-      if (actionType === 'fill') {
-        const el = await resolveLocator(page, locators, timeoutMs)
-        await el.fill(value, { timeout: timeoutMs })
-        await page.waitForTimeout(350)
-        continue
-      }
-
-      if (actionType === 'select') {
-        const el = await resolveLocator(page, locators, timeoutMs)
-        await el.selectOption(value, { timeout: timeoutMs })
-        await page.waitForTimeout(350)
-        continue
-      }
-
-      if (actionType === 'press') {
-        const pressKey = value || 'Enter'
-        if (locators && locators.length > 0) {
-          const el = await resolveLocator(page, locators, timeoutMs)
-          await el.press(pressKey, { timeout: timeoutMs })
-        } else {
-          await page.keyboard.press(pressKey)
-        }
-        await page.waitForTimeout(600)
-        continue
-      }
-
-      if (actionType === 'extract_text' && value) {
-        await page
-          .evaluate((textToSelect) => {
-            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
-            let node: Node | null
-            while ((node = walker.nextNode())) {
-              const content = node.textContent || ''
-              const idx = content.indexOf(textToSelect)
-              if (idx !== -1) {
-                const range = document.createRange()
-                range.setStart(node, idx)
-                range.setEnd(node, idx + textToSelect.length)
-                const sel = window.getSelection()
-                sel?.removeAllRanges()
-                sel?.addRange(range)
-                break
-              }
-            }
-          }, value)
-          .catch(() => {})
-        await page.waitForTimeout(350)
-        continue
-      }
-
-      if (actionType === 'wait_for_text' && value) {
-        await page.getByText(value).first().waitFor({ state: 'visible', timeout: timeoutMs })
+    for (let i = 0; i < workflow.steps.length; i += 1) {
+      const step = workflow.steps[i]
+      const stepStartedAt = Date.now()
+      const stepTitle = step.humanView?.title || `步骤 ${step.order}`
+      try {
+        const outcome = await executeWorkflowStep(context, tabMap, paramValues, step)
+        const durationMs = Date.now() - stepStartedAt
+        logs.push({
+          stepIndex: i + 1,
+          totalSteps,
+          stepId: step.id,
+          title: stepTitle,
+          actionType: step.engineBinding.actionType,
+          status: 'success',
+          durationMs,
+          locatorStrategy: outcome.locatorStrategy,
+          locatorValue: outcome.locatorValue,
+          tier: outcome.tier,
+          matchedVia: outcome.matchedVia,
+          verification: outcome.verification,
+          verificationDetail: outcome.verificationDetail,
+        })
+        options.onStep?.({
+          stepIndex: i + 1,
+          totalSteps,
+          stepId: step.id,
+          title: stepTitle,
+          status: 'success',
+          durationMs,
+          locatorStrategy: outcome.locatorStrategy,
+          tier: outcome.tier,
+          verification: outcome.verification,
+        })
+      } catch (err) {
+        const durationMs = Date.now() - stepStartedAt
+        const message = err instanceof Error ? err.message : '未知执行错误'
+        logs.push({
+          stepIndex: i + 1,
+          totalSteps,
+          stepId: step.id,
+          title: stepTitle,
+          actionType: step.engineBinding.actionType,
+          status: 'failed',
+          durationMs,
+          verification: 'failed',
+          error: message,
+        })
+        options.onStep?.({
+          stepIndex: i + 1,
+          totalSteps,
+          stepId: step.id,
+          title: stepTitle,
+          status: 'failed',
+          durationMs,
+          verification: 'failed',
+        })
+        throw err
       }
     }
 
@@ -751,26 +2047,92 @@ async function executeCompiledWorkflow(
       note: paramSummary
         ? `已执行 ${workflow.steps.length} 个工作流步骤（${paramSummary}）`
         : `已按操作工作流执行完成 ${workflow.steps.length} 个步骤`,
+      logs,
     }
   } catch (err) {
     const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1)
     const message = err instanceof Error ? err.message : '未知执行错误'
+    const failedLog = logs[logs.length - 1]
+    if (failedLog && failedLog.status === 'failed') {
+      const artifact = await captureFailureArtifact(context)
+      if (artifact) {
+        failedLog.failureScreenshot = artifact.screenshotPath
+        failedLog.pageUrl = artifact.pageUrl
+      }
+    }
     return {
       id: `r-${Date.now()}`,
       time: '刚刚',
       status: 'failed',
       duration: `${elapsed} 秒`,
       note: `执行中断：${message}`,
+      logs,
     }
   }
+}
+
+const TRACE_ACTION_LABELS: Record<string, string> = {
+  tab_open: '打开新标签页',
+  tab_close: '关闭标签页',
+  navigate: '打开页面',
+  click: '点击元素',
+  dblclick: '双击元素',
+  contextmenu: '右键菜单',
+  hover: '悬停元素',
+  drag: '拖拽元素',
+  scroll: '滚动页面',
+  dialog: '原生弹窗',
+  download: '文件下载',
+  fill: '填写输入框',
+  file_upload: '上传文件',
+  select: '选择下拉项',
+  press: '按下按键',
+  select_text: '选中页面文本',
 }
 
 /**
  * 直接根据录制下来的 RecordingTrace 复现用户的完整操作（未经过大模型编译时的兜底回放）
  */
-async function replayRecordingTrace(trace: RecordingTrace): Promise<RunRecord> {
+async function replayRecordingTrace(
+  trace: RecordingTrace,
+  options: RunOptions = {}
+): Promise<RunRecord> {
   const startedAt = Date.now()
   activeRecordingProjectId = null
+  const totalSteps = trace.events.length
+  let executedCount = 0
+  const logs: StepExecutionLog[] = []
+
+  const report = (
+    title: string,
+    status: 'success' | 'failed',
+    eventStartedAt: number,
+    locatorStrategy?: LocatorStrategy,
+    locatorValue?: string
+  ) => {
+    executedCount += 1
+    const durationMs = Date.now() - eventStartedAt
+    const verification: StepVerificationResult = status === 'success' ? 'skipped' : 'failed'
+    logs.push({
+      stepIndex: executedCount,
+      totalSteps,
+      title,
+      status,
+      durationMs,
+      locatorStrategy,
+      locatorValue,
+      verification,
+    })
+    options.onStep?.({
+      stepIndex: executedCount,
+      totalSteps,
+      title,
+      status,
+      durationMs,
+      locatorStrategy,
+      verification,
+    })
+  }
 
   try {
     const context = await getPersistentBrowserContext(false)
@@ -781,9 +2143,8 @@ async function replayRecordingTrace(trace: RecordingTrace): Promise<RunRecord> {
     const firstTabId = trace.events[0]?.pageContext.tabId || 'tab-1'
     tabMap.set(firstTabId, initialPage)
 
-    let executedCount = 0
-
     for (let i = 0; i < trace.events.length; i++) {
+      const eventStartedAt = Date.now()
       const evt = trace.events[i]
       const prevEvt = i > 0 ? trace.events[i - 1] : null
       const { tabId } = evt.pageContext
@@ -800,7 +2161,8 @@ async function replayRecordingTrace(trace: RecordingTrace): Promise<RunRecord> {
         const newPage = await context.newPage()
         await newPage.bringToFront()
         tabMap.set(tabId, newPage)
-        executedCount += 1
+        await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {})
+        report(TRACE_ACTION_LABELS.tab_open, 'success', eventStartedAt)
         continue
       }
 
@@ -808,7 +2170,7 @@ async function replayRecordingTrace(trace: RecordingTrace): Promise<RunRecord> {
         if (!page.isClosed() && context.pages().length > 1) {
           await page.close()
         }
-        executedCount += 1
+        report(TRACE_ACTION_LABELS.tab_close, 'success', eventStartedAt)
         continue
       }
 
@@ -827,8 +2189,76 @@ async function replayRecordingTrace(trace: RecordingTrace): Promise<RunRecord> {
         }
 
         await page.goto(value, { waitUntil: 'domcontentloaded', timeout: 15000 })
-        executedCount += 1
-        await page.waitForTimeout(400)
+        await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {})
+        report(TRACE_ACTION_LABELS.navigate, 'success', eventStartedAt)
+        continue
+      }
+
+      if (type === 'contextmenu' && evt.target?.locators?.length) {
+        const resolved = await resolveLocator(page, evt.target.locators, 8000)
+        const before = await captureFingerprint(page, page)
+        await resolved.locator.click({ button: 'right', timeout: 5000 })
+        await waitForInteractionEffect(page, page, before, 800)
+        report(TRACE_ACTION_LABELS.contextmenu, 'success', eventStartedAt, resolved.strategy, resolved.value)
+        continue
+      }
+
+      if (type === 'drag' && evt.target?.locators?.length && evt.dragTo?.locators?.length) {
+        const source = await resolveLocator(page, evt.target.locators, 8000)
+        const dropTarget = await resolveLocator(page, evt.dragTo.locators, 8000)
+        const before = await captureFingerprint(page, page)
+        await source.locator.dragTo(dropTarget.locator, { timeout: 5000 })
+        await waitForInteractionEffect(page, page, before, 1200)
+        report(TRACE_ACTION_LABELS.drag, 'success', eventStartedAt, source.strategy, source.value)
+        continue
+      }
+
+      if (type === 'scroll' && value) {
+        const parts = value.split(',').map((part) => Number(part) || 0)
+        await page.evaluate(
+          ({ x, y }) => window.scrollTo(x, y),
+          { x: parts[0] ?? 0, y: parts[1] ?? 0 }
+        )
+        await page.waitForTimeout(250)
+        report(TRACE_ACTION_LABELS.scroll, 'success', eventStartedAt)
+        continue
+      }
+
+      if (type === 'dialog' || type === 'download') {
+        await page.waitForTimeout(200)
+        report(
+          type === 'dialog' ? TRACE_ACTION_LABELS.dialog : TRACE_ACTION_LABELS.download,
+          'success',
+          eventStartedAt
+        )
+        continue
+      }
+
+      if (type === 'dblclick' && evt.target?.locators?.length) {
+        const resolved = await resolveLocator(page, evt.target.locators, 8000)
+        const before = await captureFingerprint(page, page)
+        await resolved.locator.dblclick({ timeout: 5000 })
+        await waitForInteractionEffect(page, page, before, 900)
+        report(TRACE_ACTION_LABELS.dblclick, 'success', eventStartedAt, resolved.strategy, resolved.value)
+        continue
+      }
+
+      if (type === 'hover' && evt.target?.locators?.length) {
+        const resolved = await resolveLocator(page, evt.target.locators, 8000)
+        await resolved.locator.hover({ timeout: 5000 })
+        await page.waitForTimeout(300)
+        report(TRACE_ACTION_LABELS.hover, 'success', eventStartedAt, resolved.strategy, resolved.value)
+        continue
+      }
+
+      if (type === 'file_upload' && evt.target?.locators?.length && value) {
+        try {
+          const resolved = await resolveLocator(page, evt.target.locators, 8000)
+          await resolved.locator.setInputFiles(resolveUploadPath(value), { timeout: 5000 })
+          report(TRACE_ACTION_LABELS.file_upload, 'success', eventStartedAt, resolved.strategy, resolved.value)
+        } catch {
+          // 回放时文件可能已不存在：跳过该动作，避免整条轨迹失败
+        }
         continue
       }
 
@@ -850,41 +2280,43 @@ async function replayRecordingTrace(trace: RecordingTrace): Promise<RunRecord> {
           continue
         }
 
-        const el = await resolveLocator(page, evt.target.locators, 8000)
-        await el.click({ timeout: 5000 })
-        executedCount += 1
+        const resolved = await resolveLocator(page, evt.target.locators, 8000)
+        const before = await captureFingerprint(page, page)
+        await resolved.locator.click({ timeout: 5000 })
         if (!rightBeforeFillSameInput) {
-          await page.waitForTimeout(350)
+          await waitForInteractionEffect(page, page, before, 900)
         }
+        report(TRACE_ACTION_LABELS.click, 'success', eventStartedAt, resolved.strategy, resolved.value)
         continue
       }
 
       if (type === 'fill' && evt.target?.locators?.length) {
-        const el = await resolveLocator(page, evt.target.locators, 8000)
-        await el.fill(value ?? '', { timeout: 5000 })
-        executedCount += 1
-        await page.waitForTimeout(350)
+        const resolved = await resolveLocator(page, evt.target.locators, 8000)
+        await resolved.locator.fill(value ?? '', { timeout: 5000 })
+        report(TRACE_ACTION_LABELS.fill, 'success', eventStartedAt, resolved.strategy, resolved.value)
         continue
       }
 
       if (type === 'select' && evt.target?.locators?.length) {
-        const el = await resolveLocator(page, evt.target.locators, 8000)
-        await el.selectOption(value ?? '', { timeout: 5000 })
-        executedCount += 1
-        await page.waitForTimeout(350)
+        const resolved = await resolveLocator(page, evt.target.locators, 8000)
+        await resolved.locator.selectOption(value ?? '', { timeout: 5000 })
+        report(TRACE_ACTION_LABELS.select, 'success', eventStartedAt, resolved.strategy, resolved.value)
         continue
       }
 
       if (type === 'press') {
         const pressKey = key || value || 'Enter'
+        const before = await captureFingerprint(page, page)
         if (evt.target?.locators?.length) {
-          const el = await resolveLocator(page, evt.target.locators, 8000)
-          await el.press(pressKey, { timeout: 5000 })
+          const resolved = await resolveLocator(page, evt.target.locators, 8000)
+          await resolved.locator.press(pressKey, { timeout: 5000 })
+          await waitForInteractionEffect(page, page, before, 2500)
+          report(TRACE_ACTION_LABELS.press, 'success', eventStartedAt, resolved.strategy, resolved.value)
         } else {
           await page.keyboard.press(pressKey)
+          await waitForInteractionEffect(page, page, before, 2500)
+          report(TRACE_ACTION_LABELS.press, 'success', eventStartedAt)
         }
-        executedCount += 1
-        await page.waitForTimeout(600)
         continue
       }
 
@@ -908,8 +2340,7 @@ async function replayRecordingTrace(trace: RecordingTrace): Promise<RunRecord> {
             }
           }, value)
           .catch(() => {})
-        executedCount += 1
-        await page.waitForTimeout(350)
+        report(TRACE_ACTION_LABELS.select_text, 'success', eventStartedAt)
       }
     }
 
@@ -920,16 +2351,28 @@ async function replayRecordingTrace(trace: RecordingTrace): Promise<RunRecord> {
       status: 'success',
       duration: `${elapsed} 秒`,
       note: `已复现完成 ${executedCount} 个录制动作`,
+      logs,
     }
   } catch (err) {
     const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1)
     const message = err instanceof Error ? err.message : '未知执行错误'
+    executedCount += 1
+    logs.push({
+      stepIndex: executedCount,
+      totalSteps,
+      title: '执行中断',
+      status: 'failed',
+      durationMs: Date.now() - startedAt,
+      verification: 'failed',
+      error: message,
+    })
     return {
       id: `r-${Date.now()}`,
       time: '刚刚',
       status: 'failed',
       duration: `${elapsed} 秒`,
       note: `复现中断：${message}`,
+      logs,
     }
   }
 }
@@ -941,31 +2384,49 @@ export async function runProjectAutomation(
   projectId: string,
   workflow?: OperationWorkflow,
   trace?: RecordingTrace,
-  runtimeParams?: Record<string, string>
+  runtimeParams?: Record<string, string>,
+  options: RunOptions = {}
 ): Promise<RunRecord> {
   const startedAt = Date.now()
   activeRecordingProjectId = null
+  resetVisualAgentBudget()
 
-  // 1. 优先读取并执行大模型编译后的结构化操作工作流
-  const resolvedWorkflow = workflow || loadWorkflow(projectId)
-  if (resolvedWorkflow && resolvedWorkflow.steps.length > 0) {
-    return executeCompiledWorkflow(resolvedWorkflow, runtimeParams)
+  // 共用一个持久化浏览器上下文，同一时刻只允许一个任务运行
+  if (activeRunProjectId) {
+    return {
+      id: `r-${Date.now()}`,
+      time: '刚刚',
+      status: 'failed',
+      duration: '0.0 秒',
+      note: `已有任务正在执行（${activeRunProjectId}），请稍后再试`,
+    }
   }
 
-  // 2. 如果还没有编译成工作流，但已经录制了原始轨迹，直接用 Playwright 复现录制动作
-  const resolvedTrace = trace || loadTrace(projectId)
-  if (resolvedTrace && resolvedTrace.events.length > 0) {
-    return replayRecordingTrace(resolvedTrace)
-  }
+  activeRunProjectId = projectId
+  try {
+    // 1. 优先读取并执行大模型编译后的结构化操作工作流
+    const resolvedWorkflow = workflow || loadWorkflow(projectId)
+    if (resolvedWorkflow && resolvedWorkflow.steps.length > 0) {
+      return await executeCompiledWorkflow(resolvedWorkflow, runtimeParams, options)
+    }
 
-  // 3. 既没有工作流也没有录制轨迹的示例项目兜底
-  await new Promise((r) => setTimeout(r, 1200))
-  const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1)
-  return {
-    id: `r-${Date.now()}`,
-    time: '刚刚',
-    status: 'success',
-    duration: `${elapsed} 秒`,
-    note: '自动化执行完成，所有操作步骤均已通过',
+    // 2. 如果还没有编译成工作流，但已经录制了原始轨迹，直接用 Playwright 复现录制动作
+    const resolvedTrace = trace || loadTrace(projectId)
+    if (resolvedTrace && resolvedTrace.events.length > 0) {
+      return await replayRecordingTrace(resolvedTrace, options)
+    }
+
+    // 3. 既没有工作流也没有录制轨迹的示例项目兜底
+    await new Promise((r) => setTimeout(r, 1200))
+    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1)
+    return {
+      id: `r-${Date.now()}`,
+      time: '刚刚',
+      status: 'success',
+      duration: `${elapsed} 秒`,
+      note: '自动化执行完成，所有操作步骤均已通过',
+    }
+  } finally {
+    activeRunProjectId = null
   }
 }

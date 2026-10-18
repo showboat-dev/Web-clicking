@@ -1,11 +1,47 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import type {
+  CandidateLocator,
+  FrameRef,
   OperationWorkflow,
+  RecordedEvent,
   RecordingTrace,
-  WorkflowParameter,
+  StepRecovery,
+  StepVerificationRule,
+  WorkflowCoverage,
   WorkflowStep,
 } from './types.ts'
+import {
+  buildAnnotationPayload,
+  buildWorkflowFromCleanTrace,
+  buildWorkflowWithAnnotations,
+  cleanTrace,
+  RULE_TRANSLATOR_VERSION,
+  validateAnnotations,
+  type AnnotationResult,
+  type CleanResult,
+} from './compiler.ts'
+
+export const TRANSLATOR_VERSION = 'v2-rules-ai-evidence.1'
+
+const VALID_ACTIONS = new Set([
+  'goto',
+  'tab_open',
+  'tab_close',
+  'click',
+  'dblclick',
+  'contextmenu',
+  'hover',
+  'drag',
+  'scroll',
+  'dialog',
+  'fill',
+  'file_upload',
+  'select',
+  'press',
+  'extract_text',
+  'wait_for_text',
+])
 
 export interface AIConfig {
   apiUrl: string
@@ -71,92 +107,33 @@ export function getAIConfig(): AIConfig {
 /**
  * 核心系统提示词：将浏览器底层录制的原始事件轨迹 (RecordingTrace) 清洗并编译为“部分固定、部分抽象参数化”的操作工作流 (OperationWorkflow)
  */
-export const WORKFLOW_COMPILER_SYSTEM_PROMPT = `你是一个专业的“网页自动化工作流清洗与参数抽象编译器”。
-你的任务是读取用户在浏览器中录制的原始底层事件轨迹（RecordingTrace JSON），完成以下两件核心工作：
-第一，剔除浏览器底层派发的冗余噪声、被动跳转和无意义误触；
-第二，将清洗后的步骤明确分类为“固定操作（fixed）”与“动态抽象操作（parameterized）”，并将所有动态操作中的输入值抽离汇总到项目顶层的参数表（parameters）中，形成一份“部分固定、部分抽象”且可由 Playwright 100% 确定性执行的结构化工作流（OperationWorkflow JSON）。
+export const WORKFLOW_COMPILER_SYSTEM_PROMPT = `你是一个网页自动化工作流的「语义标注器」。
 
-### 一、操作分类原则：区分“固定硬操作（fixed）”与“动态抽象操作（parameterized）”
+输入是一串已经由确定性规则清洗好的原子动作（actions）：去噪、合并、参数类型判定都已经完成。你的职责只有三件事：
+1. 为整条工作流写一句中文 summary；
+2. 为每一个动作写清晰的中文标题（title）与一句话说明（description）；
+3. 对 parameterized: true 的动作，给出参数英文驼峰 key、中文名称 label、中文说明 paramDescription。
 
-1. 【固定硬操作（stepCategory: "fixed"）】
-   - 定义：在工作流每次重复执行时动作和目标都保持不变的硬性步骤。
-   - 包含场景：
-     * 打开起始系统/网站入口页面（actionType: "goto"）—— 起始网址本身是该工作流的固定入口，归为 "fixed"，不要抽成动态参数。
-     * 点击网页上固定的按钮、菜单、搜索图标、提交按钮或标签页（actionType: "click"）。
-     * 按下固定的键盘按键，如回车提交或 Esc 关闭（actionType: "press"）。
-     * 新建或关闭浏览器标签页（actionType: "tab_open" | "tab_close"）。
-   - 处理方式：stepCategory 设为 "fixed"，humanView.paramKey 和 engineBinding.paramKey 均省略，固定值直接保留在 engineBinding.value 中。
+严格约束：
+- **禁止增删动作**：输入中的每个 stepId 必须输出且只输出一条标注；
+- **禁止生成或修改任何定位器 / 选择器**：定位器只来自录制证据；
+- 不要修改动作顺序、tabId、value 等执行字段；
+- parameterized 为 false 的动作不要输出 paramKey / paramLabel；
+- file_upload 动作的 paramDescription 需提醒「运行时填写本地文件绝对路径」；
+- 标题要具体（如「在搜索框输入关键词」），不要写「步骤 1」这类空话；
+- 只输出纯 JSON 对象，不要 Markdown 代码块。
 
-2. 【动态抽象操作（stepCategory: "parameterized"）】
-   - 定义：在工作流每次执行时，用户往往需要填入不同内容的可变步骤。
-   - 包含场景：
-     * 在输入框、搜索框、文本域中输入文本（actionType: "fill"）—— 输入的文本内容一定是不固定的，必须抽象为动态参数！
-     * 在下拉选择框中切换筛选项（actionType: "select"）—— 选择的项通常也是可变的，应当抽象为动态参数。
-   - 处理方式：
-     * 将该步骤的 stepCategory 设为 "parameterized"；
-     * 为该输入项设计一个语义清晰的英文驼峰参数名（如 searchKeyword、orderNumber、applicantName），填入该步骤的 humanView.paramKey 和 engineBinding.paramKey；
-     * 同时在顶层的 parameters 数组中注册该参数（包含 key、纯中文名称 label、中文说明 description、inputType、录制时的原始值 defaultValue、当前值 value，以及绑定的步骤 ID 列表 boundStepIds）。
-
-### 二、四大底层降噪清洗规则（极其重要，必须严格遵守）
-
-1. 【剔除浏览器底层合成点击、Label 关联连带点击与零尺寸隐藏元素】
-   - 当用户在输入框按下回车（action.type === "press"，value === "Enter"）时，网页常会在几毫秒内自动派发一个隐藏提交按钮的合成点击（特征：紧跟在 press 之后 100ms 内，或 target.boundingBox 宽高为 0，或紧接着又触发一次输入框自身的 click）。
-   - 当用户点击某个 <label>（如必应的 label#search_icon）或外层容器时，浏览器常会在极短时间内（deltaMsFromPrev < 50ms，通常仅隔 1~10 毫秒）自动触发其关联的 <input type="submit">（如 input#sb_form_go）的第二次 click 事件。这属于单次鼠标点击引发的浏览器底层连带事件，**必须只保留第一个 click，剔除 50ms 内紧跟的第二个连带 click**！
-   - 此外，如果用户在页面 A 只是聚焦点了一下某个输入框但未输入任何内容，紧接着就直接在同一个标签页导航（navigate）到了完全无关的页面 B 开始正式操作，说明页面 A 只是误开或放弃的页面，也应作为前置无效操作一并剔除。
-
-2. 【剔除由点击或回车引发的被动路由跳转（navigate）】
-   - 只有用户主动打开起始网页的第一个 navigate 事件需要转换为 actionType: "goto"（若有 URL 重定向，取稳定后的起始 URL）。
-   - 当用户执行了 click 或 press("Enter") 之后几秒内发生的 navigate 事件（比如跳转到搜索结果页 "/search?q=..." 及随后的重定向），是前一步动作自然引发的页面跳转结果，**严禁**将它们编译成额外的 "goto" 步骤！
-
-3. 【合并输入框的“前置聚焦点击”与“输入内容”】
-   - 用户在输入框打字前通常会先 click 一下该输入框，紧接着在同一输入框触发 fill。
-   - Playwright 的 fill() 会自动聚焦元素，因此请将“点击某输入框 + 在同一输入框 fill”合并为一个单独的 actionType: "fill"（stepCategory: "parameterized"）步骤，并把这两个原始事件的 id 都放入该步骤的 sourceEventIds 中。
-
-4. 【候选定位器（locators）100% 原样保真】
-   - 凡是涉及 DOM 元素的步骤（click / fill / select / press），其 engineBinding.locators 数组必须 **原封不动地拷贝** 自对应原始事件的 target.locators。
-   - **严禁**你自己编造或修改任何 CSS 选择器、ID 或 XPath。goto / tab_open / tab_close 步骤的 locators 传空数组 []。
-
-### 三、输出 JSON 结构规范（严格输出纯 JSON 对象）
-
+输出结构：
 {
-  "projectId": "与输入一致的 projectId",
-  "updatedAt": "当前 ISO 时间字符串",
-  "summary": "用一句自然的中文总结该工作流完成的业务事项",
-  "removedNoiseCount": 被清洗剔除或合并掉的原始冗余事件数量（整数）,
-  "parameters": [
+  "summary": "一句话中文总结该工作流完成的业务事项",
+  "annotations": [
     {
-      "key": "英文驼峰参数名，如 searchKeyword",
-      "label": "简明中文参数名，如 搜索关键词",
-      "description": "中文说明该参数用于哪个页面的哪个输入框",
-      "inputType": "text | select | number",
-      "defaultValue": "录制时的原始值，如 hello",
-      "value": "默认与 defaultValue 相同，如 hello",
-      "required": true,
-      "boundStepIds": ["step-2"]
-    }
-  ],
-  "steps": [
-    {
-      "id": "step-1",
-      "order": 1,
-      "stepCategory": "fixed | parameterized",
-      "sourceEventIds": ["evt-xxx"],
-      "humanView": {
-        "title": "简短清晰的中文步骤标题（如：打开必应搜索首页 / 输入搜索关键词 / 按下回车执行搜索）",
-        "description": "一句话中文说明这一步的具体作用",
-        "paramKey": "仅当 stepCategory 为 parameterized 时填写，对应 parameters 中的 key",
-        "paramLabel": "仅当 stepCategory 为 parameterized 时填写，对应 parameters 中的 label"
-      },
-      "engineBinding": {
-        "tabId": "继承自原始事件 pageContext.tabId，如 tab-1",
-        "frameUrl": "若原始事件有 pageContext.frameUrl 则保留，否则省略",
-        "actionType": "goto | tab_open | tab_close | click | fill | select | press | extract_text | wait_for_text",
-        "paramKey": "仅当 stepCategory 为 parameterized 时填写，对应 parameters 中的 key",
-        "value": "固定操作的值（如 goto 的网址、press 的 Enter）或动态参数的初始默认值",
-        "locators": [],
-        "timeoutMs": 8000,
-        "optional": false
-      }
+      "stepId": "cstep-1",
+      "title": "打开必应搜索首页",
+      "description": "导航到必应首页作为流程起点",
+      "paramKey": "仅 parameterized 动作填写，如 searchKeyword",
+      "paramLabel": "仅 parameterized 动作填写，如 搜索关键词",
+      "paramDescription": "仅 parameterized 动作填写，说明参数用途"
     }
   ]
 }`
@@ -164,36 +141,15 @@ export const WORKFLOW_COMPILER_SYSTEM_PROMPT = `你是一个专业的“网页�
 /**
  * 为发送给大模型的 Trace 去除不必要的大体积字段，并附带相邻事件时间差辅助识别合成事件
  */
-function buildCompactTraceForPrompt(trace: RecordingTrace) {
-  return {
-    projectId: trace.projectId,
-    recordedAt: trace.recordedAt,
-    overallGoal: trace.overallGoal,
-    totalRawEvents: trace.events.length,
-    events: trace.events.map((evt, index) => ({
-      index: index + 1,
-      id: evt.id,
-      timestamp: evt.timestamp,
-      deltaMsFromPrev: index > 0 ? evt.timestamp - trace.events[index - 1].timestamp : 0,
-      pageContext: evt.pageContext,
-      action: evt.action,
-      target: evt.target,
-      userComment: evt.userComment,
-    })),
-  }
-}
-
 /**
- * 使用 Node.js 原生 fetch 调用 DeepSeek 接口，将录制轨迹 (RecordingTrace) 清洗编译为操作工作流 (OperationWorkflow)
+ * 调用大模型做「语义标注」（不生成步骤、不生成定位器）
  */
-export async function compileTraceToWorkflow(trace: RecordingTrace): Promise<OperationWorkflow> {
-  const config = getAIConfig()
-
-  if (!config.apiKey) {
-    throw new Error('尚未配置 DeepSeek 密钥，请在项目根目录的 .env 文件中填入 DEEPSEEK_API_KEY')
-  }
-
-  const compactTrace = buildCompactTraceForPrompt(trace)
+async function annotateWithAI(
+  clean: CleanResult,
+  trace: RecordingTrace,
+  config: AIConfig
+): Promise<AnnotationResult> {
+  const payload = buildAnnotationPayload(trace, clean)
 
   const response = await fetch(config.apiUrl, {
     method: 'POST',
@@ -201,17 +157,18 @@ export async function compileTraceToWorkflow(trace: RecordingTrace): Promise<Ope
       'Content-Type': 'application/json',
       Authorization: `Bearer ${config.apiKey}`,
     },
+    signal: AbortSignal.timeout(60_000),
     body: JSON.stringify({
       model: config.model,
       response_format: { type: 'json_object' },
+      temperature: 0.1,
       messages: [
         { role: 'system', content: WORKFLOW_COMPILER_SYSTEM_PROMPT },
         {
           role: 'user',
-          content: `请清洗并编译以下录制的原始轨迹数据，区分固定操作（fixed）与动态参数操作（parameterized），输出结构化的 OperationWorkflow JSON：\n${JSON.stringify(compactTrace, null, 2)}`,
+          content: `请为以下原子动作输出语义标注（必须覆盖所有 stepId）：\n${JSON.stringify(payload, null, 2)}`,
         },
       ],
-      temperature: 0.1,
     }),
   })
 
@@ -224,106 +181,276 @@ export async function compileTraceToWorkflow(trace: RecordingTrace): Promise<Ope
     choices?: Array<{ message?: { content?: string } }>
   }
   const content = data.choices?.[0]?.message?.content
-  if (!content) {
-    throw new Error('大模型接口返回内容为空')
+  if (!content) throw new Error('大模型接口返回内容为空')
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(content)
+  } catch {
+    throw new Error('大模型返回内容不是合法 JSON')
   }
 
-  const parsed = JSON.parse(content) as Partial<OperationWorkflow>
-  const rawSteps = Array.isArray(parsed.steps) ? parsed.steps : []
-  const rawParams = Array.isArray(parsed.parameters) ? parsed.parameters : []
+  const validation = validateAnnotations(parsed, clean.steps)
+  if (!validation.valid || !validation.annotation) {
+    throw new Error(`大模型标注未通过 Schema 校验：${validation.errors.slice(0, 3).join('；')}`)
+  }
+  return validation.annotation
+}
 
-  const normalizedSteps: WorkflowStep[] = rawSteps.map((step, idx) => {
-    const id = step.id || `step-${idx + 1}`
-    const actionType = step.engineBinding?.actionType || 'click'
-    const paramKey = step.engineBinding?.paramKey || step.humanView?.paramKey
-    const isParameterized =
-      step.stepCategory === 'parameterized' ||
-      Boolean(paramKey) ||
-      actionType === 'fill' ||
-      actionType === 'select'
+/**
+ * 使用 Node.js 原生 fetch 调用 DeepSeek 接口，将录制轨迹 (RecordingTrace) 清洗编译为操作工作流 (OperationWorkflow)
+ */
+/**
+ * 旧版「整包工作流」结构校验（保留给回归测试与外部调用）
+ */
+export function validateRawWorkflow(raw: unknown): { valid: boolean; errors: string[] } {
+  const errors: string[] = []
+  if (!raw || typeof raw !== 'object') {
+    return { valid: false, errors: ['模型输出不是 JSON 对象'] }
+  }
+  const obj = raw as Record<string, unknown>
+  if (obj.steps !== undefined && !Array.isArray(obj.steps)) errors.push('steps 不是数组')
+  if (obj.parameters !== undefined && !Array.isArray(obj.parameters)) errors.push('parameters 不是数组')
 
-    return {
-      id,
-      order: idx + 1,
-      stepCategory: isParameterized ? 'parameterized' : 'fixed',
-      sourceEventIds: Array.isArray(step.sourceEventIds) ? step.sourceEventIds : [],
-      humanView: {
-        title: step.humanView?.title || `步骤 ${idx + 1}`,
-        description: step.humanView?.description || '',
-        ...(isParameterized && paramKey ? { paramKey } : {}),
-        ...(isParameterized && step.humanView?.paramLabel
-          ? { paramLabel: step.humanView.paramLabel }
-          : {}),
-      },
-      engineBinding: {
-        tabId: step.engineBinding?.tabId || 'tab-1',
-        ...(step.engineBinding?.frameUrl ? { frameUrl: step.engineBinding.frameUrl } : {}),
-        actionType,
-        ...(isParameterized && paramKey ? { paramKey } : {}),
-        ...(step.engineBinding?.value !== undefined ? { value: step.engineBinding.value } : {}),
-        locators: Array.isArray(step.engineBinding?.locators) ? step.engineBinding.locators : [],
-        timeoutMs: step.engineBinding?.timeoutMs || 8000,
-        optional: Boolean(step.engineBinding?.optional),
-      },
-    }
-  })
-
-  // 归一化顶层项目参数列表，并确保每个 parameterized 步骤都有对应的顶层参数定义
-  const paramMap = new Map<string, WorkflowParameter>()
-  for (const p of rawParams) {
-    if (!p || !p.key) continue
-    const defVal = String(p.defaultValue ?? p.value ?? '')
-    paramMap.set(p.key, {
-      key: p.key,
-      label: p.label || p.key,
-      description: p.description || '',
-      inputType: p.inputType || 'text',
-      defaultValue: defVal,
-      value: String(p.value ?? defVal),
-      required: p.required !== false,
-      boundStepIds: Array.isArray(p.boundStepIds) ? p.boundStepIds : [],
+  if (Array.isArray(obj.steps)) {
+    obj.steps.forEach((item, index) => {
+      if (!item || typeof item !== 'object') {
+        errors.push(`steps[${index}] 不是对象`)
+        return
+      }
+      const step = item as Record<string, unknown>
+      const binding = step.engineBinding as Record<string, unknown> | undefined
+      if (!binding || typeof binding !== 'object') {
+        errors.push(`steps[${index}] 缺少 engineBinding`)
+        return
+      }
+      const actionType = binding.actionType
+      if (typeof actionType !== 'string' || !VALID_ACTIONS.has(actionType)) {
+        errors.push(`steps[${index}] actionType 非法：${String(actionType)}`)
+      }
     })
   }
 
-  for (const step of normalizedSteps) {
-    if (step.stepCategory === 'parameterized') {
-      const key = step.engineBinding.paramKey || `param_${step.order}`
-      step.humanView.paramKey = key
-      step.engineBinding.paramKey = key
-      const existing = paramMap.get(key)
-      if (existing) {
-        if (!existing.boundStepIds.includes(step.id)) {
-          existing.boundStepIds.push(step.id)
+  return { valid: errors.length === 0, errors }
+}
+
+function deriveRecovery(event: RecordedEvent): StepRecovery | undefined {
+  const target = event.target
+  if (!target) return undefined
+
+  const recovery: StepRecovery = {}
+  if (event.pageContext.frameChain?.length) recovery.frameChain = event.pageContext.frameChain
+  if (target.shadowChain?.length) recovery.shadowChain = target.shadowChain
+  if (target.domSnapshot) recovery.domSnapshot = target.domSnapshot
+  if (target.nearbyLabel) recovery.nearbyText = target.nearbyLabel
+  if (target.role) recovery.role = target.role
+  if (target.innerText) recovery.innerText = target.innerText
+  if (target.tagName) recovery.tagName = target.tagName
+  if (target.attributes) recovery.attributes = target.attributes
+  if (target.boundingBox) recovery.bbox = target.boundingBox
+  if (event.screenshotPath) recovery.referenceScreenshot = event.screenshotPath
+
+  return Object.keys(recovery).length > 0 ? recovery : undefined
+}
+
+/** 从录制证据派生额外的候选定位器（L2 结构恢复的确定性弹药） */
+export function deriveCandidateLocators(
+  event: RecordedEvent,
+  existing: CandidateLocator[]
+): CandidateLocator[] {
+  const target = event.target
+  if (!target) return []
+
+  const seen = new Set(existing.map((loc) => `${loc.strategy}:${loc.value}`))
+  const derived: CandidateLocator[] = []
+  const push = (strategy: CandidateLocator['strategy'], value: string | undefined, priority: number) => {
+    if (!value) return
+    const normalized = value.trim().slice(0, 120)
+    if (!normalized) return
+    const key = `${strategy}:${normalized}`
+    if (seen.has(key)) return
+    seen.add(key)
+    derived.push({ strategy, value: normalized, priority })
+  }
+
+  const name = target.innerText || target.nearbyLabel
+  if (target.role && name && name.length <= 40) push('role', `${target.role}:${name}`, 8)
+  if (target.innerText && target.innerText.length >= 2 && target.innerText.length <= 40) {
+    push('text', target.innerText, 9)
+  }
+  if (target.nearbyLabel) push('label', target.nearbyLabel, 10)
+
+  const tag = target.tagName || '*'
+  const attrs = target.attributes || {}
+  const testId = attrs['data-testid'] || attrs['data-test']
+  if (testId) push('css', `${tag}[data-testid="${testId}"]`, 8)
+  if (attrs.name) push('css', `${tag}[name="${attrs.name}"]`, 11)
+  if (attrs.placeholder) push('css', `${tag}[placeholder="${attrs.placeholder}"]`, 12)
+  if (attrs['aria-label']) push('css', `${tag}[aria-label="${attrs['aria-label']}"]`, 12)
+
+  return derived
+}
+
+function deriveFrameChain(event: RecordedEvent): FrameRef[] | undefined {
+  if (event.pageContext.frameChain?.length) return event.pageContext.frameChain
+  if (event.pageContext.frameUrl) return [{ url: event.pageContext.frameUrl }]
+  return undefined
+}
+
+/** 依据「录制时的后续事件」推导动作后置校验（最可靠的确定性来源） */
+export function deriveVerification(
+  step: WorkflowStep,
+  primaryIndex: number | undefined,
+  events: RecordedEvent[]
+): StepVerificationRule | undefined {
+  const actionType = step.engineBinding.actionType
+  if (actionType === 'fill' || actionType === 'select' || actionType === 'file_upload') {
+    return { mode: 'value' }
+  }
+  if (actionType === 'goto') {
+    const expected = step.engineBinding.value
+    return expected ? { mode: 'url', expected } : undefined
+  }
+  if (actionType !== 'click' && actionType !== 'press' && actionType !== 'dblclick') return undefined
+  if (primaryIndex === undefined) return undefined
+
+  const startedAt = events[primaryIndex].timestamp
+  for (let i = primaryIndex + 1; i < events.length; i += 1) {
+    const next = events[i]
+    if (next.timestamp - startedAt > 3000) break
+    if (next.action.type === 'navigate' && next.action.value) {
+      return { mode: 'url', expected: next.action.value, timeoutMs: 5000 }
+    }
+    if (next.action.type === 'click' || next.action.type === 'fill') break
+  }
+  return undefined
+}
+
+export function buildCoverage(
+  trace: RecordingTrace,
+  steps: WorkflowStep[]
+): WorkflowCoverage {
+  const mapped = new Set<string>()
+  for (const step of steps) {
+    for (const id of step.sourceEventIds || []) mapped.add(id)
+  }
+  const unmapped = trace.events.filter((event) => !mapped.has(event.id))
+  const warnings: string[] = []
+  if (unmapped.length > 0) {
+    warnings.push(
+      `有 ${unmapped.length} 个原始事件未被映射到任何步骤，可能存在漏步骤（前 5 个：${unmapped
+        .slice(0, 5)
+        .map((event) => event.id)
+        .join(', ')}）`
+    )
+  }
+  if (steps.length === 0) warnings.push('工作流没有任何步骤')
+
+  return {
+    totalEvents: trace.events.length,
+    mappedEvents: trace.events.length - unmapped.length,
+    droppedEvents: unmapped.length,
+    unmappedEventIds: unmapped.map((event) => event.id),
+    warnings,
+  }
+}
+
+/**
+ * 用原始录制证据增强工作流（P1）：补齐 frameChain / 结构恢复证据 / 派生定位器 / 后置校验。
+ * 注意：不覆盖规则编译或 AI 标注已经生成的 verification / coverage / translatorVersion。
+ */
+export function enrichWorkflowWithEvidence(
+  trace: RecordingTrace,
+  workflow: OperationWorkflow
+): OperationWorkflow {
+  const eventIndex = new Map<string, number>()
+  trace.events.forEach((event, index) => eventIndex.set(event.id, index))
+
+  const steps = workflow.steps.map((step) => {
+    const sourceIds = step.sourceEventIds || []
+    let primaryIndex: number | undefined
+    for (const id of sourceIds) {
+      const index = eventIndex.get(id)
+      if (index === undefined) continue
+      if (trace.events[index].target) {
+        primaryIndex = index
+        break
+      }
+    }
+    if (primaryIndex === undefined) {
+      for (const id of sourceIds) {
+        const index = eventIndex.get(id)
+        if (index !== undefined) {
+          primaryIndex = index
+          break
         }
-        if (!step.humanView.paramLabel) {
-          step.humanView.paramLabel = existing.label
-        }
-      } else {
-        const defVal = String(step.engineBinding.value ?? '')
-        const label = step.humanView.paramLabel || step.humanView.title
-        paramMap.set(key, {
-          key,
-          label,
-          description: step.humanView.description || label,
-          inputType: step.engineBinding.actionType === 'select' ? 'select' : 'text',
-          defaultValue: defVal,
-          value: defVal,
-          required: true,
-          boundStepIds: [step.id],
-        })
+      }
+    }
+
+    const engineBinding = { ...step.engineBinding }
+    const primary = primaryIndex !== undefined ? trace.events[primaryIndex] : undefined
+    if (primary) {
+      const frameChain = deriveFrameChain(primary)
+      if (frameChain) engineBinding.frameChain = frameChain
+      const recovery = deriveRecovery(primary)
+      if (recovery) engineBinding.recovery = recovery
+      engineBinding.locators = [
+        ...step.engineBinding.locators,
+        ...deriveCandidateLocators(primary, step.engineBinding.locators),
+      ]
+      if (!engineBinding.verification) {
+        const verification = deriveVerification(step, primaryIndex, trace.events)
+        if (verification) engineBinding.verification = verification
+      }
+    }
+
+    return { ...step, engineBinding }
+  })
+
+  return {
+    ...workflow,
+    schemaVersion: 2,
+    translatorVersion: workflow.translatorVersion ?? TRANSLATOR_VERSION,
+    coverage: workflow.coverage ?? buildCoverage(trace, steps),
+    steps,
+  }
+}
+
+/**
+ * 把录制轨迹编译为工作流：
+ * 1. 确定性规则清洗 + 规则编译（兜底，永远可用）；
+ * 2. 若配置了 API Key，再调用大模型做语义标注（只改文案/参数命名，不增删步骤）；
+ * 3. AI 失败自动回退规则生成，并在 coverage.warnings 中记录；
+ * 4. 最后用原始录制证据增强（frameChain / recovery / 派生定位器）。
+ */
+export async function compileTraceToWorkflow(trace: RecordingTrace): Promise<OperationWorkflow> {
+  const clean = cleanTrace(trace)
+  if (clean.steps.length === 0) {
+    throw new Error('录制轨迹清洗后没有可执行步骤，请检查录制内容')
+  }
+
+  const config = getAIConfig()
+  let workflow = buildWorkflowFromCleanTrace(trace, clean)
+
+  if (config.apiKey) {
+    try {
+      const annotation = await annotateWithAI(clean, trace, config)
+      workflow = buildWorkflowWithAnnotations(trace, clean, annotation)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'AI 语义标注失败'
+      workflow = {
+        ...workflow,
+        translatorVersion: `${RULE_TRANSLATOR_VERSION}+fallback`,
+        coverage: {
+          ...(workflow.coverage as WorkflowCoverage),
+          warnings: [
+            ...(workflow.coverage?.warnings ?? []),
+            `AI 语义标注失败，已回退规则生成：${message}`,
+          ],
+        },
       }
     }
   }
 
-  return {
-    projectId: trace.projectId,
-    updatedAt: new Date().toISOString(),
-    summary: parsed.summary || trace.overallGoal || '自动生成的网页操作工作流',
-    removedNoiseCount:
-      typeof parsed.removedNoiseCount === 'number'
-        ? parsed.removedNoiseCount
-        : Math.max(0, trace.events.length - normalizedSteps.length),
-    parameters: Array.from(paramMap.values()),
-    steps: normalizedSteps,
-  }
+  return enrichWorkflowWithEvidence(trace, workflow)
 }

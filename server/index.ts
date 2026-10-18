@@ -3,6 +3,7 @@ import express from 'express'
 import { WebSocketServer } from 'ws'
 import { compileTraceToWorkflow, getAIConfig } from './ai.ts'
 import {
+  getActiveRunProjectId,
   onTraceUpdated,
   openRecordingBrowser,
   runProjectAutomation,
@@ -18,7 +19,14 @@ import {
   SCREENSHOTS_DIR,
   updateWorkflowParameters,
 } from './store.ts'
-import type { Project, RecordingTrace } from './types.ts'
+import type {
+  OperationWorkflow,
+  Project,
+  RecordingTrace,
+  RunAccepted,
+  RunRecord,
+  ServerMessage,
+} from './types.ts'
 
 ensureDataDirs()
 
@@ -199,7 +207,7 @@ app.delete('/api/projects/:id', (req, res) => {
   res.json({ success: true })
 })
 
-// 触发运行项目工作流或直接复现录制轨迹（支持在请求体中携带本次运行的动态参数）
+// 触发运行项目工作流或直接复现录制轨迹（异步任务：立即返回 runId，进度通过 WebSocket 推送）
 app.post('/api/projects/:id/run', async (req, res) => {
   const { id } = req.params
   const { parameters } = (req.body || {}) as { parameters?: Record<string, string> }
@@ -210,30 +218,34 @@ app.post('/api/projects/:id/run', async (req, res) => {
     return
   }
 
+  if (getActiveRunProjectId()) {
+    res.status(409).json({ error: '已有任务正在执行，请等待完成后再试' })
+    return
+  }
+
   if (parameters && typeof parameters === 'object' && Object.keys(parameters).length > 0) {
     updateWorkflowParameters(id, parameters)
   }
 
   const latestTarget = loadProjects().find((p) => p.id === id) || target
-  const runRecord = await runProjectAutomation(
-    id,
-    latestTarget.workflow,
-    latestTarget.trace,
-    parameters
-  )
-  const latestProjects = loadProjects().map((p) =>
-    p.id === id
-      ? {
-          ...p,
-          lastStatus: runRecord.status,
-          runs: [runRecord, ...p.runs],
-        }
-      : p
-  )
-  saveProjects(latestProjects)
+  const workflow = latestTarget.workflow || loadWorkflow(id) || undefined
+  const trace = latestTarget.trace || loadTrace(id) || undefined
+  const totalSteps =
+    workflow && workflow.steps.length > 0
+      ? workflow.steps.length
+      : trace && trace.events.length > 0
+        ? trace.events.length
+        : 1
+  const runId = `run-${Date.now()}`
 
-  const updatedProject = latestProjects.find((p) => p.id === id)
-  res.json(updatedProject)
+  // 先落 running 状态并立即返回，真正的执行放到后台，进度逐条通过 WS 推送
+  saveProjects(
+    loadProjects().map((p) => (p.id === id ? { ...p, lastStatus: 'running' as const } : p))
+  )
+  const accepted: RunAccepted = { accepted: true, runId, totalSteps }
+  res.status(202).json(accepted)
+
+  void startBackgroundRun({ projectId: id, runId, totalSteps, workflow, trace, parameters })
 })
 
 // 提交录制轨迹并由大模型清洗编译生成操作工作流 (OperationWorkflow)
@@ -267,25 +279,132 @@ app.post('/api/projects/:id/compile', async (req, res) => {
 
 const server = http.createServer(app)
 
-// WebSocket 通道：实时推送录制到的每一个动作与最新步骤数
+// WebSocket 通道：实时推送录制动作与自动化运行进度
 const wss = new WebSocketServer({ server, path: '/ws' })
 wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'connected', message: '已连接至本地自动化后端服务' }))
 })
 
-onTraceUpdated((projectId, trace, latestEvent) => {
-  const payload = JSON.stringify({
-    type: 'trace_updated',
-    projectId,
-    stepsCount: trace.events.length,
-    latestEvent,
-  })
+function broadcast(message: ServerMessage) {
+  const payload = JSON.stringify(message)
   for (const client of wss.clients) {
     if (client.readyState === 1) {
       client.send(payload)
     }
   }
+}
+
+onTraceUpdated((projectId, trace, latestEvent) => {
+  broadcast({
+    type: 'trace_updated',
+    projectId,
+    stepsCount: trace.events.length,
+    latestEvent,
+  })
 })
+
+interface BackgroundRunContext {
+  projectId: string
+  runId: string
+  totalSteps: number
+  workflow?: OperationWorkflow
+  trace?: RecordingTrace
+  parameters?: Record<string, string>
+}
+
+/**
+ * 后台执行一次自动化运行：开始/每一步/结束都通过 WS 推送，结束时把 RunRecord 写回 projects.json
+ */
+async function startBackgroundRun(ctx: BackgroundRunContext): Promise<void> {
+  const { projectId, runId, totalSteps } = ctx
+  broadcast({
+    type: 'run_started',
+    projectId,
+    runId,
+    totalSteps,
+    startedAt: new Date().toISOString(),
+  })
+
+  let runRecord: RunRecord
+  try {
+    runRecord = await runProjectAutomation(projectId, ctx.workflow, ctx.trace, ctx.parameters, {
+      onStep: (progress) => {
+        broadcast({ type: 'run_progress', projectId, runId, ...progress })
+      },
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : '未知执行错误'
+    runRecord = {
+      id: runId,
+      time: '刚刚',
+      status: 'failed',
+      duration: '0.0 秒',
+      note: `执行中断：${message}`,
+    }
+  }
+
+  // 统一用受理时生成的 runId 作为运行记录 id，便于前端/日志关联
+  runRecord = { ...runRecord, id: runId }
+
+  const updatedProjects = loadProjects().map((p) =>
+    p.id === projectId
+      ? { ...p, lastStatus: runRecord.status, runs: [runRecord, ...p.runs] }
+      : p
+  )
+  saveProjects(updatedProjects)
+
+  const updatedProject = updatedProjects.find((p) => p.id === projectId)
+  if (updatedProject) {
+    broadcast({ type: 'run_finished', projectId, runId, runRecord, project: updatedProject })
+  }
+
+  if (runRecord.status === 'failed') {
+    void notifyRunFailure(projectId, updatedProject?.name, runRecord)
+  }
+}
+
+/**
+ * 失败告警：始终打日志；配置 ALERT_WEBHOOK_URL 时额外 POST 到自定义 Webhook
+ */
+async function notifyRunFailure(
+  projectId: string,
+  projectName: string | undefined,
+  runRecord: RunRecord
+): Promise<void> {
+  const failedStep = runRecord.logs?.find((log) => log.status === 'failed')
+  const payload = {
+    type: 'run_failed',
+    projectId,
+    projectName,
+    runId: runRecord.id,
+    note: runRecord.note,
+    failedStep: failedStep
+      ? {
+          title: failedStep.title,
+          error: failedStep.error,
+          verification: failedStep.verification,
+          failureScreenshot: failedStep.failureScreenshot,
+          pageUrl: failedStep.pageUrl,
+        }
+      : undefined,
+  }
+
+  console.warn(
+    `[alert] 任务运行失败 project=${projectId} run=${runRecord.id}：${runRecord.note}`
+  )
+
+  const webhook = process.env.ALERT_WEBHOOK_URL
+  if (!webhook) return
+  try {
+    await fetch(webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  } catch (err) {
+    console.warn('[alert] Webhook 发送失败：', err)
+  }
+}
 
 const PORT = Number(process.env.PORT || 3001)
 server.listen(PORT, () => {

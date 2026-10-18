@@ -174,6 +174,59 @@ export function updateWorkflowParameters(
   return saveWorkflow(projectId, updatedWorkflow)
 }
 
+function firstLocatorValue(target?: RecordedEvent['target']): string | undefined {
+  return target?.locators?.[0]?.value
+}
+
+/**
+ * 双击合并：把刚记录的最后一条 click 替换为 dblclick（避免延迟上报导致导航时丢失）
+ */
+export function replaceTrailingClickWithDblclick(
+  projectId: string,
+  event: RecordedEvent
+): RecordingTrace {
+  ensureDataDirs()
+  const existing = loadTrace(projectId) || {
+    projectId,
+    recordedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    events: [],
+  }
+
+  const last = existing.events[existing.events.length - 1]
+  const sameTarget =
+    firstLocatorValue(last?.target) === firstLocatorValue(event.target) ||
+    (!firstLocatorValue(event.target) && !firstLocatorValue(last?.target))
+  if (
+    last &&
+    last.action.type === 'click' &&
+    sameTarget &&
+    event.timestamp - last.timestamp <= 800
+  ) {
+    existing.events.pop()
+  }
+
+  existing.events.push(event)
+  existing.updatedAt = new Date().toISOString()
+  const filePath = getTraceFilePath(projectId)
+  fs.writeFileSync(filePath, JSON.stringify(existing, null, 2), 'utf-8')
+
+  const projects = loadProjects()
+  saveProjects(
+    projects.map((p) =>
+      p.id === projectId
+        ? {
+            ...p,
+            traceFile: `data/traces/${projectId}.json`,
+            stepsCount: existing.events.length,
+            trace: existing,
+          }
+        : p
+    )
+  )
+  return existing
+}
+
 export function appendRecordedEvent(projectId: string, event: RecordedEvent): RecordingTrace {
   ensureDataDirs()
   const existing = loadTrace(projectId) || {
