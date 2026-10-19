@@ -93,6 +93,29 @@ function frameChainOf(event: RecordedEvent): FrameRef[] | undefined {
 /**
  * 规则清洗：把原始事件序列折叠成原子动作
  */
+/** 提交类 URL 里的 sys_id / UUID / 长数字每次都会变，校验时替换成通配符，避免回放误判 */
+export function stabilizeVerificationUrl(url: string): string {
+  try {
+    const parsed = new URL(url)
+    const params = new URLSearchParams(parsed.search)
+    let changed = false
+    for (const [key, value] of Array.from(params.entries())) {
+      if (
+        /^[0-9a-f]{32}$/i.test(value) ||
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value) ||
+        /^\d{8,}$/.test(value)
+      ) {
+        params.set(key, '*')
+        changed = true
+      }
+    }
+    if (!changed) return url
+    return `${parsed.origin}${parsed.pathname}?${params.toString()}${parsed.hash}`
+  } catch {
+    return url
+  }
+}
+
 export function cleanTrace(trace: RecordingTrace): CleanResult {
   const events = trace.events
   const noise: NoiseEvent[] = []
@@ -328,9 +351,10 @@ export function cleanTrace(trace: RecordingTrace): CleanResult {
         continue
       }
       const last = steps[steps.length - 1]
-      if (last && last.tabId === tabId && event.timestamp - last.startedAt <= 2500) {
+      // 真实站点提交后跳转可能较慢（ServiceNow 约 2-5s），无中间动作时仍归因给上一步
+      if (last && last.tabId === tabId && event.timestamp - last.startedAt <= 15000) {
         // 点击/回车引发的被动跳转：不单独成步，而是作为上一步的后置校验
-        last.verification = { mode: 'url', expected: url, timeoutMs: 5000 }
+        last.verification = { mode: 'url', expected: stabilizeVerificationUrl(url), timeoutMs: 5000 }
         drop(event, 'passive-navigate')
         continue
       }
@@ -340,7 +364,7 @@ export function cleanTrace(trace: RecordingTrace): CleanResult {
         value: url,
         startedAt: event.timestamp,
         sourceEventIds: [event.id],
-        verification: { mode: 'url', expected: url, timeoutMs: 5000 },
+        verification: { mode: 'url', expected: stabilizeVerificationUrl(url), timeoutMs: 5000 },
         parameterized: false,
       })
       continue
@@ -387,6 +411,7 @@ function deriveRecovery(
   const recovery: StepRecovery = {}
   if (referenceScreenshot) recovery.referenceScreenshot = referenceScreenshot
   if (target.shadowChain?.length) recovery.shadowChain = target.shadowChain
+  if (target.shadowMode) recovery.shadowMode = target.shadowMode
   if (target.domSnapshot) recovery.domSnapshot = target.domSnapshot
   if (target.nearbyLabel) recovery.nearbyText = target.nearbyLabel
   if (target.role) recovery.role = target.role

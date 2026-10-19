@@ -273,17 +273,19 @@ const INJECTED_RECORDER_SCRIPT = `
 
   function shadowChainFor(el) {
     const hosts = [];
+    let closed = false;
     let node = el;
     while (node && node.nodeType === Node.ELEMENT_NODE) {
       const root = node.getRootNode ? node.getRootNode() : null;
       if (root && root.host) {
+        if (root.mode === 'closed') closed = true;
         hosts.unshift(nthOfTypePath(root.host));
         node = root.host;
       } else {
         break;
       }
     }
-    return hosts;
+    return { hosts, closed };
   }
 
   function buildTargetInfo(el) {
@@ -333,7 +335,7 @@ const INJECTED_RECORDER_SCRIPT = `
       height: Math.round(rect.height),
     };
 
-    const shadowChain = shadowChainFor(el);
+    const shadowInfo = shadowChainFor(el);
     const domSnapshot = el.outerHTML ? el.outerHTML.slice(0, 1500) : undefined;
 
     return {
@@ -344,7 +346,10 @@ const INJECTED_RECORDER_SCRIPT = `
       attributes: Object.keys(attrs).length ? attrs : undefined,
       locators,
       boundingBox,
-      ...(shadowChain.length ? { shadowChain } : {}),
+      ...(shadowInfo.hosts.length ? { shadowChain: shadowInfo.hosts } : {}),
+      ...(shadowInfo.hosts.length
+        ? { shadowMode: shadowInfo.closed ? 'closed' : 'open' }
+        : {}),
       ...(domSnapshot ? { domSnapshot } : {}),
     };
   }
@@ -357,10 +362,87 @@ const INJECTED_RECORDER_SCRIPT = `
 
   // Shadow DOM 穿透：事件冒到 document 时 target 会被重定向成宿主（如 ServiceNow 的 now-* 组件），
   // composedPath()[0] 才是用户真正操作的内部节点（open shadow root 下可见）。
+  // closed shadow root 的 composedPath 在树外会被截断，只能拿到宿主。
+  // 在页面脚本执行前 hook attachShadow 保存 closed root 引用，
+  // 再用「坐标命中 / 当前焦点」反查真实内部节点（不依赖事件监听顺序）。
+  const closedRootByHost = new WeakMap();
+  const originalAttachShadow = Element.prototype.attachShadow;
+  if (typeof originalAttachShadow === 'function') {
+    Element.prototype.attachShadow = function (init) {
+      const root = originalAttachShadow.call(this, init);
+      try {
+        if (!init || init.mode !== 'open') closedRootByHost.set(this, root);
+      } catch (err) { /* ignore */ }
+      return root;
+    };
+  }
+
+  function rootOf(el) {
+    if (!el) return null;
+    return el.shadowRoot || closedRootByHost.get(el) || null;
+  }
+
+  // 在 root 内按坐标找最深层元素（closed root 无法用 elementFromPoint 穿透）
+  function deepestAt(root, x, y) {
+    let best = null;
+    let bestArea = Infinity;
+    let nodes = [];
+    try { nodes = root.querySelectorAll('*'); } catch (err) { return null; }
+    for (const el of nodes) {
+      const rect = el.getBoundingClientRect();
+      if (!rect.width || !rect.height) continue;
+      if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) continue;
+      const area = rect.width * rect.height;
+      if (area >= bestArea) continue;
+      best = el;
+      bestArea = area;
+    }
+    if (!best) return null;
+    const deeperRoot = rootOf(best);
+    if (deeperRoot) {
+      const deeper = deepestAt(deeperRoot, x, y);
+      if (deeper) return deeper;
+    }
+    return best;
+  }
+
+  // 当前焦点所在的最深层元素（键盘输入类事件没有可用坐标）
+  function focusedDeep() {
+    let el = document.activeElement;
+    const seen = new Set();
+    while (el && !seen.has(el)) {
+      seen.add(el);
+      const root = rootOf(el);
+      if (!root || !root.activeElement) break;
+      el = root.activeElement;
+    }
+    return el instanceof Element ? el : null;
+  }
+
   function deepTarget(e) {
     try {
+      const marked = e && e.__webclickRealTarget;
+      if (marked instanceof Element) return marked;
       const path = typeof e.composedPath === 'function' ? e.composedPath() : null;
-      if (path && path.length && path[0] instanceof Element) return path[0];
+      const candidate = path && path.length && path[0] instanceof Element
+        ? path[0]
+        : (e.target instanceof Element ? e.target : null);
+      if (!candidate) return null;
+
+      const closedRoot = closedRootByHost.get(candidate);
+      if (closedRoot) {
+        const hasPoint = typeof e.clientX === 'number' && typeof e.clientY === 'number' && (e.clientX || e.clientY);
+        if (hasPoint) {
+          const hit = deepestAt(closedRoot, e.clientX, e.clientY);
+          if (hit) return hit;
+        }
+        const focused = focusedDeep();
+        if (focused && (closedRoot === focused.getRootNode() || closedRoot.contains(focused))) {
+          return focused;
+        }
+        return candidate;
+      }
+      return candidate;
     } catch (err) { /* ignore */ }
     return e.target instanceof Element ? e.target : null;
   }
@@ -399,7 +481,7 @@ const INJECTED_RECORDER_SCRIPT = `
   }
 
   // 旧版 Select2 / ARIA 选项靠 mousedown、mouseup 选中，常常不派发 click
-  const POINTER_CLICK_SELECTOR = '.select2-choice, .select2-result, .select2-results li, [role="option"]';
+  const POINTER_CLICK_SELECTOR = '.select2-container, .select2-choice, .select2-result, .select2-results li, [role="option"]';
 
   // 0. 悬停：驻留 450ms 才记录，避免鼠标划过产生噪声
   let hoverTimer = null;
@@ -577,6 +659,19 @@ const INJECTED_RECORDER_SCRIPT = `
   document.addEventListener('mousedown', (e) => {
     if (!e.isTrusted || e.button !== 0) return;
     lastMouseDown = { x: e.clientX, y: e.clientY };
+
+    // Select2 / ARIA 下拉在 mousedown 阶段展开，mouseup 时命中的可能已是浮层，
+    // 因此在 mousedown 就补记一次点击（后续真实 click 由 200ms 去重拦掉）。
+    const rawDownEl = deepTarget(e);
+    if (!(rawDownEl instanceof Element)) return;
+    const pointerDownTarget = closestDeep(rawDownEl, POINTER_CLICK_SELECTOR);
+    if (!pointerDownTarget || wasRecentlyRecorded(pointerDownTarget) || wasRecentlyRecorded(rawDownEl)) return;
+    const recordDownTarget = pointerDownTarget.matches('.select2-container')
+      ? pointerDownTarget.querySelector('.select2-choice') || pointerDownTarget
+      : pointerDownTarget;
+    markRecordedClick(pointerDownTarget);
+    cancelHover();
+    sendEvent({ actionType: 'click', target: buildTargetInfo(recordDownTarget) });
   }, true);
   document.addEventListener('mouseup', (e) => {
     if (!e.isTrusted) return;
@@ -589,9 +684,13 @@ const INJECTED_RECORDER_SCRIPT = `
       if (rawEl instanceof Element) {
         const pointerTarget = closestDeep(rawEl, POINTER_CLICK_SELECTOR);
         if (pointerTarget && !wasRecentlyRecorded(pointerTarget) && !wasRecentlyRecorded(rawEl)) {
+          // Select2 的点击目标是容器 div，记录内部可见的 a.select2-choice 更利于回放定位
+          const recordTarget = pointerTarget.matches('.select2-container')
+            ? pointerTarget.querySelector('.select2-choice') || pointerTarget
+            : pointerTarget;
           markRecordedClick(pointerTarget);
           cancelHover();
-          sendEvent({ actionType: 'click', target: buildTargetInfo(pointerTarget) });
+          sendEvent({ actionType: 'click', target: buildTargetInfo(recordTarget) });
         }
       }
       return;
@@ -1300,7 +1399,13 @@ function urlMatchesExpected(actual: string, expected: string): boolean {
     if (actualUrl.origin !== expectedUrl.origin) return false
     if (actualUrl.pathname.replace(/\/$/, '') !== expectedUrl.pathname.replace(/\/$/, '')) return false
     for (const [key, value] of expectedUrl.searchParams) {
-      if (actualUrl.searchParams.get(key) !== value) return false
+      const actualValue = actualUrl.searchParams.get(key)
+      // 编译期把动态 ID（如 ServiceNow sys_id）转成 *，回放时只要求参数存在、值任意
+      if (value === '*') {
+        if (actualValue === null || actualValue === '') return false
+        continue
+      }
+      if (actualValue !== value) return false
     }
     return true
   } catch {
@@ -1637,6 +1742,20 @@ async function resolveOrVisual(
   value?: string,
   expectedValue?: string
 ): Promise<ResolveOrVisualResult> {
+  // closed shadow DOM：Playwright 无法穿透，直接走 L3 视觉兜底（若可用）
+  if (step.engineBinding.recovery?.shadowMode === 'closed' && canUseVisualAgent()) {
+    const visual = await tryVisualFallback({
+      page,
+      step,
+      action,
+      value,
+      expectedValue,
+      timeoutMs,
+    })
+    if (visual) return { visual }
+    throw new Error('closed shadow DOM 元素无法用 DOM 定位，视觉兜底未命中')
+  }
+
   try {
     const resolved = await resolveLocatorWithRecovery(scope, step, timeoutMs)
     return { resolved }

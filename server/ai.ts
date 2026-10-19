@@ -20,6 +20,7 @@ import {
   validateAnnotations,
   type AnnotationResult,
   type CleanResult,
+  stabilizeVerificationUrl,
 } from './compiler.ts'
 
 export const TRANSLATOR_VERSION = 'v2-rules-ai-evidence.1'
@@ -241,6 +242,7 @@ function deriveRecovery(event: RecordedEvent): StepRecovery | undefined {
   const recovery: StepRecovery = {}
   if (event.pageContext.frameChain?.length) recovery.frameChain = event.pageContext.frameChain
   if (target.shadowChain?.length) recovery.shadowChain = target.shadowChain
+  if (target.shadowMode) recovery.shadowMode = target.shadowMode
   if (target.domSnapshot) recovery.domSnapshot = target.domSnapshot
   if (target.nearbyLabel) recovery.nearbyText = target.nearbyLabel
   if (target.role) recovery.role = target.role
@@ -309,7 +311,7 @@ export function deriveVerification(
   }
   if (actionType === 'goto') {
     const expected = step.engineBinding.value
-    return expected ? { mode: 'url', expected } : undefined
+    return expected ? { mode: 'url', expected: stabilizeVerificationUrl(expected) } : undefined
   }
   if (actionType !== 'click' && actionType !== 'press' && actionType !== 'dblclick') return undefined
   if (primaryIndex === undefined) return undefined
@@ -317,9 +319,9 @@ export function deriveVerification(
   const startedAt = events[primaryIndex].timestamp
   for (let i = primaryIndex + 1; i < events.length; i += 1) {
     const next = events[i]
-    if (next.timestamp - startedAt > 3000) break
+    if (next.timestamp - startedAt > 15000) break
     if (next.action.type === 'navigate' && next.action.value) {
-      return { mode: 'url', expected: next.action.value, timeoutMs: 5000 }
+      return { mode: 'url', expected: stabilizeVerificationUrl(next.action.value), timeoutMs: 5000 }
     }
     if (next.action.type === 'click' || next.action.type === 'fill') break
   }

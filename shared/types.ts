@@ -40,8 +40,10 @@ export interface TargetEvidence {
   attributes?: Record<string, string>
   locators: CandidateLocator[]
   boundingBox?: { x: number; y: number; width: number; height: number }
-  /** open shadow DOM 的 host 链 */
+  /** shadow DOM 的 host 链（顶层向下） */
   shadowChain?: string[]
+  /** shadow root 模式：closed 时 Playwright 无法穿透，只能走视觉兜底 */
+  shadowMode?: 'open' | 'closed'
   /** 目标元素的 outerHTML 片段 */
   domSnapshot?: string
 }
@@ -149,6 +151,8 @@ export type WorkflowActionType =
 export interface StepRecovery {
   frameChain?: FrameRef[]
   shadowChain?: string[]
+  /** closed shadow root 无法被 Playwright 穿透，执行器应直接走 L3 */
+  shadowMode?: 'open' | 'closed'
   domSnapshot?: string
   nearbyText?: string
   role?: string

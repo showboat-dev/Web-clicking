@@ -333,6 +333,8 @@ v2 解决的是工程结构问题，**尚未解决「录不全 / 译不准 / 跑
 
 **真站回归已完成（2026-10-18）**：5 个公开站点（example.com / selenium web-form / Wikipedia / Hacker News / 百度）跑通「录制 → AI 编译 → 执行 → 稳定性复跑」，另覆盖 replay、L2、L3 mock、失败注入专项，结果 **42 通过 / 0 失败 / 1 跳过（百度反爬）**。期间修复 5 类真实缺陷：导航型点击丢失、URL 校验过严、nearbyLabel 误取、候选定位歧义、按键瞬时不可用。详见 [`TESTING.md`](./TESTING.md)。
 
+**ServiceNow 端到端验证（2026-10-19）**：dev403453 Employee Center「Create Incident」完成登录 → Select2 选 Urgency → 填描述 → 提交 → 回放，回放新建工单 INC0010007（录制 INC0010006），15/15 通过。为此修复：closed shadow root 捕获（`attachShadow` hook + 坐标/焦点反查，Playwright 无法穿透时走 L3）、Select2 下拉在 mousedown 阶段补记点击、提交后 URL 中 `sys_id` 等动态 ID 编译期转 `*` 通配、密码以运行参数注入。
+
 **L3 视觉 Agent MVP 已落地（2026-10-18）**：新增 `visual-agent/server.py`（mock sidecar，`/health` + `/ground`）与 `server/visualAgent.ts` 客户端；执行器在 L1/L2 失败后按配置触发视觉兜底，坐标点击/输入后走统一验证器，`tier=L3` 进入遥测；预算（单步 1 次、单次运行 3 次）、置信度阈值 0.6、服务不可用快速降级；参考截图与 bbox 来自录制证据。详见 [`L3-VISUAL-AGENT.md`](./L3-VISUAL-AGENT.md)。
 
 **P2 翻译器改造已落地（2026-10-18）**：`server/compiler.ts` 承担确定性清洗（合成点击 / 被动跳转 / 聚焦合并 / 空标签页 / 悬停噪声）与规则编译；AI 只输出 summary、标题说明与参数命名，必须通过 Schema 校验且覆盖全部 stepId；AI 不可用或失败时自动回退 `rules-only` 工作流；覆盖审计输出 `coverage.dropReasons`，`translatorVersion` 标识本次路径（`ai-annot` / `fallback` / `rules-only`）。
@@ -415,7 +417,7 @@ data/                          # .gitignore 已排除
 | 中 | **JSON 写无锁 / 非原子** | 覆盖写没有临时文件 + rename，进程崩溃可能留下半截文件；多写者无并发保护 |
 | 中 | **无测试 / 无 CI** | 定位器降级、AI 归一化、参数双写、异步运行状态机零覆盖；`lint` 脚本未接入流程 |
 | 低 | ✅ 执行遥测与失败现场（P0/P1 完成） | 每步记录命中策略、L1/L2 层级、耗时、校验结果、失败原因；失败自动存现场截图与 URL |
-| 低 | 录制覆盖已补齐（P1 完成） | 已补 hover / dblclick / contextmenu / drag / scroll / dialog / download / 富文本 / 文件上传 / Tab 方向键；closed shadow、canvas 与组合键仍不可录 |
+| 低 | 录制覆盖已补齐（P1 完成 + 2026-10-19 增补） | 已补 hover / dblclick / contextmenu / drag / scroll / dialog / download / 富文本 / 文件上传 / Tab 方向键；closed shadow 通过 hook `attachShadow` 捕获（Playwright 无法穿透，执行走 L3）；canvas 与组合键仍不可录 |
 | 低 | 真站语料仍有限 | 当前 5 个公开站点；反爬站点（百度）无法自动化；建议扩到 10–20 个异构站点作为回归基准 |
 | 低 | 翻译器已改为规则 + AI 标注（P2 完成） | 结构由规则层确定性生成，AI 只做语义标注且可回退；剩余问题是 AI 文案质量波动，不影响步骤结构与定位器 |
 | 中 | L3 视觉 Agent 已接骨架（MVP） | mock 链路与预算/降级/遥测已验证；真实内网 VLM 接入、成功回写 IR、准确率基准集仍待做（见 `L3-VISUAL-AGENT.md`） |
