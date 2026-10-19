@@ -18,6 +18,7 @@ import {
   requestGrounding,
   resetVisualAgentBudget,
 } from './visualAgent.ts'
+import { trySubmitServiceNowCatalog } from './servicenowCatalog.ts'
 import type {
   CandidateLocator,
   FrameRef,
@@ -223,7 +224,9 @@ const INJECTED_RECORDER_SCRIPT = `
   function findNearbyLabel(el) {
     if (!el) return undefined;
     if (el.id) {
-      const lbl = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      const root = el.getRootNode && el.getRootNode();
+      const scope = root && typeof root.querySelector === 'function' ? root : document;
+      const lbl = scope.querySelector('label[for="' + CSS.escape(el.id) + '"]');
       if (lbl && lbl.innerText) return lbl.innerText.trim().slice(0, 60);
     }
     const parentLabel = el.closest('label');
@@ -352,6 +355,52 @@ const INJECTED_RECORDER_SCRIPT = `
     }
   }
 
+  // Shadow DOM 穿透：事件冒到 document 时 target 会被重定向成宿主（如 ServiceNow 的 now-* 组件），
+  // composedPath()[0] 才是用户真正操作的内部节点（open shadow root 下可见）。
+  function deepTarget(e) {
+    try {
+      const path = typeof e.composedPath === 'function' ? e.composedPath() : null;
+      if (path && path.length && path[0] instanceof Element) return path[0];
+    } catch (err) { /* ignore */ }
+    return e.target instanceof Element ? e.target : null;
+  }
+
+  // 跨 Shadow 边界向上找可交互祖先（closest 不会穿出 shadow root）
+  function closestDeep(el, selector) {
+    let cur = el;
+    while (cur instanceof Element) {
+      const hit = cur.closest(selector);
+      if (hit) return hit;
+      const root = cur.getRootNode ? cur.getRootNode() : null;
+      cur = root && root.host ? root.host : null;
+    }
+    return null;
+  }
+
+  // 同一元素 200ms 内只记一条 click：mouseup 补记与原生 click 监听互相去重
+  let recentClickEl = null;
+  let recentClickAt = 0;
+  function sameClickTarget(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    try {
+      if (a.contains(b) || b.contains(a)) return true;
+    } catch (err) { /* ignore */ }
+    return false;
+  }
+  function wasRecentlyRecorded(el) {
+    if (!recentClickEl || !el) return false;
+    if (Date.now() - recentClickAt > 200) return false;
+    return sameClickTarget(recentClickEl, el);
+  }
+  function markRecordedClick(el) {
+    recentClickEl = el;
+    recentClickAt = Date.now();
+  }
+
+  // 旧版 Select2 / ARIA 选项靠 mousedown、mouseup 选中，常常不派发 click
+  const POINTER_CLICK_SELECTOR = '.select2-choice, .select2-result, .select2-results li, [role="option"]';
+
   // 0. 悬停：驻留 450ms 才记录，避免鼠标划过产生噪声
   let hoverTimer = null;
   let lastHoverEl = null;
@@ -363,13 +412,13 @@ const INJECTED_RECORDER_SCRIPT = `
   }
   document.addEventListener('mouseover', (e) => {
     if (!e.isTrusted) return;
-    const el = e.target instanceof Element ? e.target : null;
+    const el = deepTarget(e);
     if (!el) return;
     cancelHover();
     hoverTimer = setTimeout(() => {
       hoverTimer = null;
       if (el === lastHoverEl) return;
-      const matched = el.closest('button, a, [role="button"], [role="menuitem"], [role="tab"], [role="link"], [data-testid], li, label');
+      const matched = closestDeep(el, 'button, a, [role="button"], [role="menuitem"], [role="tab"], [role="link"], [data-testid], li, label');
       const style = window.getComputedStyle(el);
       const cursorPointer = style && style.cursor === 'pointer';
       if (!matched && !cursorPointer) return;
@@ -385,31 +434,33 @@ const INJECTED_RECORDER_SCRIPT = `
   // 1. 点击：立即上报（避免导航卸载打断上报）；双击由主进程把最后一条 click 替换为 dblclick
   document.addEventListener('click', (e) => {
     if (!e.isTrusted) return;
-    const rawEl = e.target;
+    const rawEl = deepTarget(e);
     if (!(rawEl instanceof Element)) return;
     if (e.detail >= 2) return;
     cancelHover();
-    const interactive = rawEl.closest('button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], label') || rawEl;
+    const interactive = closestDeep(rawEl, 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], label') || rawEl;
+    if (wasRecentlyRecorded(interactive) || wasRecentlyRecorded(rawEl)) return;
     const targetInfo = buildTargetInfo(interactive);
     if (e.detail === 0 && targetInfo?.boundingBox && targetInfo.boundingBox.width === 0 && targetInfo.boundingBox.height === 0) {
       return;
     }
+    markRecordedClick(interactive);
     sendEvent({ actionType: 'click', target: targetInfo });
   }, true);
 
   document.addEventListener('dblclick', (e) => {
     if (!e.isTrusted) return;
     cancelHover();
-    const rawEl = e.target;
+    const rawEl = deepTarget(e);
     if (!(rawEl instanceof Element)) return;
-    const interactive = rawEl.closest('button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], label, [contenteditable="true"]') || rawEl;
+    const interactive = closestDeep(rawEl, 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], label, [contenteditable="true"]') || rawEl;
     sendEvent({ actionType: 'dblclick', target: buildTargetInfo(interactive) });
   }, true);
 
   // 2. 输入框 / 富文本编辑区变更（文件上传单独由 change 事件记录）
   document.addEventListener('input', (e) => {
     if (!e.isTrusted) return;
-    const el = e.target;
+    const el = deepTarget(e);
     if (!(el instanceof HTMLElement)) return;
     cancelHover();
     const tag = el.tagName.toLowerCase();
@@ -433,7 +484,7 @@ const INJECTED_RECORDER_SCRIPT = `
 
   document.addEventListener('change', (e) => {
     if (!e.isTrusted) return;
-    const el = e.target;
+    const el = deepTarget(e);
     if (!(el instanceof HTMLElement)) return;
     if (el.tagName.toLowerCase() === 'select') {
       sendEvent({
@@ -457,7 +508,7 @@ const INJECTED_RECORDER_SCRIPT = `
     const trackedKeys = ['Enter', 'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
     if (!trackedKeys.includes(e.key)) return;
     cancelHover();
-    const el = e.target instanceof Element ? e.target : document.activeElement;
+    const el = deepTarget(e) || document.activeElement;
     const tag = el && el.tagName ? el.tagName.toLowerCase() : '';
     const isTypingField = tag === 'input' || tag === 'textarea' || (el && el.isContentEditable);
     // 输入框内的可打印字符由 input 事件以 fill 记录，这里只保留提交/取消/导航类按键
@@ -474,9 +525,9 @@ const INJECTED_RECORDER_SCRIPT = `
   document.addEventListener('contextmenu', (e) => {
     if (!e.isTrusted) return;
     cancelHover();
-    const el = e.target instanceof Element ? e.target : null;
+    const el = deepTarget(e);
     if (!el) return;
-    const interactive = el.closest('button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="tab"], label, [contenteditable="true"]') || el;
+    const interactive = closestDeep(el, 'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="tab"], label, [contenteditable="true"]') || el;
     sendEvent({ actionType: 'contextmenu', target: buildTargetInfo(interactive) });
   }, true);
 
@@ -485,15 +536,15 @@ const INJECTED_RECORDER_SCRIPT = `
   let lastDragAt = 0;
   document.addEventListener('dragstart', (e) => {
     if (!e.isTrusted) return;
-    const el = e.target instanceof Element ? e.target : null;
+    const el = deepTarget(e);
     if (!el) return;
-    dragSource = buildTargetInfo(el.closest('[draggable="true"], [draggable]') || el);
+    dragSource = buildTargetInfo(closestDeep(el, '[draggable="true"], [draggable]') || el);
   }, true);
   document.addEventListener('drop', (e) => {
     if (!e.isTrusted) return;
-    const el = e.target instanceof Element ? e.target : null;
+    const el = deepTarget(e);
     if (!el || !dragSource) return;
-    const dropTarget = buildTargetInfo(el.closest('[data-drop], [role="listitem"], li, div') || el);
+    const dropTarget = buildTargetInfo(closestDeep(el, '[data-drop], [role="listitem"], li, div') || el);
     sendEvent({ actionType: 'drag', target: dragSource, dragTo: dropTarget });
     dragSource = null;
   }, true);
@@ -532,7 +583,19 @@ const INJECTED_RECORDER_SCRIPT = `
     if (e.button !== 0) return;
     if (dragSource || Date.now() - lastDragAt < 300) return;
     const moved = Math.hypot(e.clientX - lastMouseDown.x, e.clientY - lastMouseDown.y);
-    if (moved < 20) return;
+    // 位移很小才视为点击；拖选文本仍走下面的 select_text
+    if (moved < 20) {
+      const rawEl = deepTarget(e);
+      if (rawEl instanceof Element) {
+        const pointerTarget = closestDeep(rawEl, POINTER_CLICK_SELECTOR);
+        if (pointerTarget && !wasRecentlyRecorded(pointerTarget) && !wasRecentlyRecorded(rawEl)) {
+          markRecordedClick(pointerTarget);
+          cancelHover();
+          sendEvent({ actionType: 'click', target: buildTargetInfo(pointerTarget) });
+        }
+      }
+      return;
+    }
     const sel = window.getSelection();
     const selectedText = sel ? sel.toString().trim() : '';
     if (selectedText && selectedText.length >= 2) {
@@ -1950,7 +2013,37 @@ async function executeCompiledWorkflow(
 
   const logs: StepExecutionLog[] = []
   const totalSteps = workflow.steps.length
+  const skippedHovers: Array<{ order: number; title: string; reason: string }> = []
   let context: BrowserContext | null = null
+
+  try {
+    const submitted = await trySubmitServiceNowCatalog(workflow, paramValues)
+    if (submitted) {
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1)
+      const paramSummary = Array.from(paramValues.values())
+        .map((item) => `${item.label}：${item.value}`)
+        .join('，')
+      return {
+        id: `r-${Date.now()}`,
+        time: '刚刚',
+        status: 'success',
+        duration: `${elapsed} 秒`,
+        note: `已通过 ServiceNow API 提交「${submitted.itemName}」，单号 ${submitted.number}${paramSummary ? `（${paramSummary}）` : ''}`,
+        logs,
+      }
+    }
+  } catch (err) {
+    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1)
+    const message = err instanceof Error ? err.message : 'ServiceNow API 提交失败'
+    return {
+      id: `r-${Date.now()}`,
+      time: '刚刚',
+      status: 'failed',
+      duration: `${elapsed} 秒`,
+      note: `执行中断：${message}`,
+      logs,
+    }
+  }
 
   try {
     context = await getPersistentBrowserContext(false)
@@ -2011,6 +2104,32 @@ async function executeCompiledWorkflow(
       } catch (err) {
         const durationMs = Date.now() - stepStartedAt
         const message = err instanceof Error ? err.message : '未知执行错误'
+        // 悬停是非关键动作：目标不存在（如下拉未打开）时记警告并跳过，不中断后续步骤
+        if (step.engineBinding.actionType === 'hover') {
+          console.warn(`[warn] 跳过悬停步骤 ${step.order}「${stepTitle}」：${message}`)
+          skippedHovers.push({ order: step.order, title: stepTitle, reason: message })
+          logs.push({
+            stepIndex: i + 1,
+            totalSteps,
+            stepId: step.id,
+            title: stepTitle,
+            actionType: 'hover',
+            status: 'success',
+            durationMs,
+            verification: 'skipped',
+            verificationDetail: `已跳过悬停：${message}`,
+          })
+          options.onStep?.({
+            stepIndex: i + 1,
+            totalSteps,
+            stepId: step.id,
+            title: stepTitle,
+            status: 'success',
+            durationMs,
+            verification: 'skipped',
+          })
+          continue
+        }
         logs.push({
           stepIndex: i + 1,
           totalSteps,
@@ -2039,14 +2158,20 @@ async function executeCompiledWorkflow(
     const paramSummary = Array.from(paramValues.values())
       .map((p) => `${p.label}：${p.value}`)
       .join('，')
+    const skipNote =
+      skippedHovers.length > 0
+        ? `，已跳过悬停 ${skippedHovers
+            .map((item) => `步骤 ${item.order}「${item.title}」（${item.reason}）`)
+            .join('；')}`
+        : ''
     return {
       id: `r-${Date.now()}`,
       time: '刚刚',
       status: 'success',
       duration: `${elapsed} 秒`,
       note: paramSummary
-        ? `已执行 ${workflow.steps.length} 个工作流步骤（${paramSummary}）`
-        : `已按操作工作流执行完成 ${workflow.steps.length} 个步骤`,
+        ? `已执行 ${workflow.steps.length} 个工作流步骤（${paramSummary}）${skipNote}`
+        : `已按操作工作流执行完成 ${workflow.steps.length} 个步骤${skipNote}`,
       logs,
     }
   } catch (err) {
@@ -2102,6 +2227,7 @@ async function replayRecordingTrace(
   const totalSteps = trace.events.length
   let executedCount = 0
   const logs: StepExecutionLog[] = []
+  const skippedReplayHovers: string[] = []
 
   const report = (
     title: string,
@@ -2244,10 +2370,20 @@ async function replayRecordingTrace(
       }
 
       if (type === 'hover' && evt.target?.locators?.length) {
-        const resolved = await resolveLocator(page, evt.target.locators, 8000)
-        await resolved.locator.hover({ timeout: 5000 })
-        await page.waitForTimeout(300)
-        report(TRACE_ACTION_LABELS.hover, 'success', eventStartedAt, resolved.strategy, resolved.value)
+        const hoverLabel = evt.target.innerText
+          ? `悬停「${evt.target.innerText}」`
+          : TRACE_ACTION_LABELS.hover
+        try {
+          const resolved = await resolveLocator(page, evt.target.locators, 8000)
+          await resolved.locator.hover({ timeout: 5000 })
+          await page.waitForTimeout(300)
+          report(TRACE_ACTION_LABELS.hover, 'success', eventStartedAt, resolved.strategy, resolved.value)
+        } catch (err) {
+          const message = err instanceof Error ? err.message : '未知执行错误'
+          console.warn(`[warn] 跳过悬停回放「${hoverLabel}」：${message}`)
+          skippedReplayHovers.push(`${hoverLabel}（${message}）`)
+          report(TRACE_ACTION_LABELS.hover, 'success', eventStartedAt)
+        }
         continue
       }
 
@@ -2350,7 +2486,9 @@ async function replayRecordingTrace(
       time: '刚刚',
       status: 'success',
       duration: `${elapsed} 秒`,
-      note: `已复现完成 ${executedCount} 个录制动作`,
+      note: skippedReplayHovers.length
+        ? `已复现完成 ${executedCount} 个录制动作，已跳过悬停 ${skippedReplayHovers.join('；')}`
+        : `已复现完成 ${executedCount} 个录制动作`,
       logs,
     }
   } catch (err) {
