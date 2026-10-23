@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { chromium, type BrowserContext, type Frame, type Locator, type Page } from 'playwright'
+import { isTransientRedirectUrl } from './compiler.ts'
 import {
   appendRecordedEvent,
   BROWSER_PROFILE_DIR,
@@ -1509,9 +1510,15 @@ async function verifyStepOutcome(params: {
     try {
       if (rule.mode === 'url') {
         const matched = await waitForUrlContains(page, expected, timeoutMs)
-        return matched
-          ? { result: 'verified', detail: `URL 含「${expected}」` }
-          : { result: 'failed', detail: `URL 未包含「${expected}」（当前 ${page.url()}）` }
+        if (matched) return { result: 'verified', detail: `URL 含「${expected}」` }
+        const currentUrl = page.url()
+        if (isTransientRedirectUrl(currentUrl)) {
+          return {
+            result: 'failed',
+            detail: `站点触发验证码/风控（${new URL(currentUrl).hostname}），未能完成「${expected}」校验`,
+          }
+        }
+        return { result: 'failed', detail: `URL 未包含「${expected}」（当前 ${currentUrl}）` }
       }
       if (rule.mode === 'title') {
         const matched = await waitForTitleContains(page, expected, timeoutMs)

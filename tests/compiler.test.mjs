@@ -173,5 +173,44 @@ check(
   JSON.stringify(newWorkflow.coverage.dropReasons)
 )
 
+
+// ---------------------------------------------------------------
+// 5. 初始 tab_open / 新标签页导航 / 验证码跳转
+// ---------------------------------------------------------------
+const tabTrace = {
+  projectId: 'proj-tab',
+  recordedAt: new Date(1000).toISOString(),
+  updatedAt: new Date(1000).toISOString(),
+  overallGoal: '新标签页与验证码清洗',
+  events: [
+    ev('t1', 1000, 'tab_open', { category: 'window', tabId: 'tab-2', value: 'about:blank' }),
+    ev('t2', 2000, 'navigate', { tabId: 'tab-2', value: 'https://www.baidu.com/' }),
+    ev('t3', 3000, 'click', { tabId: 'tab-2', target: target('#kw', { tagName: 'input' }) }),
+    ev('t4', 4000, 'navigate', { tabId: 'tab-2', value: 'https://www.baidu.com/s?wd=test' }),
+    ev('t5', 5000, 'navigate', { tabId: 'tab-2', value: 'https://wappass.baidu.com/static/captcha/tuxing.html?x=1' }),
+    ev('t6', 6000, 'navigate', { tabId: 'tab-2', value: 'https://www.baidu.com/s?wd=test&page=2' }),
+    ev('t7', 7000, 'tab_open', { category: 'window', tabId: 'tab-3', value: 'about:blank' }),
+    ev('t8', 7100, 'navigate', { tabId: 'tab-3', value: 'https://example.com/next' }),
+  ],
+}
+const tabClean = cleanTrace(tabTrace)
+const tabReasons = tabClean.noise.map((item) => item.reason)
+check('清洗：录制开头的初始 tab_open 被丢弃', tabReasons.includes('initial-tab-open') && tabClean.steps[0].actionType === 'goto')
+check(
+  '清洗：tab_open 后的导航落成 goto（不是空白页点击）',
+  tabClean.steps[0].actionType === 'goto' && tabClean.steps[0].value === 'https://www.baidu.com/'
+)
+check(
+  '清洗：点击后的首个被动跳转作为校验',
+  tabClean.steps[1].verification?.mode === 'url' && tabClean.steps[1].verification?.expected === 'https://www.baidu.com/s?wd=test'
+)
+check('清洗：验证码跳转被丢弃', tabReasons.includes('transient-redirect'))
+check('清洗：后续重复被动跳转不覆盖校验', tabReasons.includes('duplicate-passive-navigate'))
+const midTabOpen = tabClean.steps.slice(2)
+check(
+  '清洗：中途新标签页保留 tab_open + goto',
+  midTabOpen[0]?.actionType === 'tab_open' && midTabOpen[1]?.actionType === 'goto' && midTabOpen[1]?.value === 'https://example.com/next'
+)
+
 console.log(`\n=== compiler：${passed}/${passed + failed} 通过 ===`)
 process.exit(failed === 0 ? 0 : 1)

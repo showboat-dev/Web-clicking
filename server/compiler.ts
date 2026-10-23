@@ -116,6 +116,20 @@ export function stabilizeVerificationUrl(url: string): string {
   }
 }
 
+/**
+ * 验证码 / 风控 / 登录跳转不属于业务结果，不能拿来当后置校验。
+ * 只用于「点击后被动跳转」场景，避免把正常 goto 登录页也误删。
+ */
+export function isTransientRedirectUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    const haystack = `${parsed.hostname}${parsed.pathname}`.toLowerCase()
+    return /(captcha|antibot|wappass|challenge|verify|passport|oauth|sso|login)/.test(haystack)
+  } catch {
+    return false
+  }
+}
+
 export function cleanTrace(trace: RecordingTrace): CleanResult {
   const events = trace.events
   const noise: NoiseEvent[] = []
@@ -334,6 +348,11 @@ export function cleanTrace(trace: RecordingTrace): CleanResult {
     }
 
     if (type === 'tab_open' || type === 'tab_close') {
+      // 录制开始时的首个 tab_open 通常只是初始 about:blank 页面，回放时已有一个页面，无需重开
+      if (type === 'tab_open' && steps.length === 0) {
+        drop(event, 'initial-tab-open')
+        continue
+      }
       pushStep({
         actionType: type,
         tabId,
@@ -351,8 +370,32 @@ export function cleanTrace(trace: RecordingTrace): CleanResult {
         continue
       }
       const last = steps[steps.length - 1]
+      if (last && last.actionType === 'tab_open' && last.tabId === tabId) {
+        // 新标签页是空白页，必须把紧接着的导航落成 goto，否则后续动作都作用在 about:blank 上
+        pushStep({
+          actionType: 'goto',
+          tabId,
+          value: url,
+          startedAt: event.timestamp,
+          sourceEventIds: [event.id],
+          verification: { mode: 'url', expected: stabilizeVerificationUrl(url), timeoutMs: 5000 },
+          parameterized: false,
+        })
+        drop(event, 'tab-open-followed-by-navigate')
+        continue
+      }
       // 真实站点提交后跳转可能较慢（ServiceNow 约 2-5s），无中间动作时仍归因给上一步
       if (last && last.tabId === tabId && event.timestamp - last.startedAt <= 15000) {
+        // 验证码/风控/登录跳转不是业务成功信号
+        if (isTransientRedirectUrl(url)) {
+          drop(event, 'transient-redirect')
+          continue
+        }
+        // 只取第一次被动跳转作为校验；后续跳转（如结果页→验证码）不覆盖
+        if (last.verification) {
+          drop(event, 'duplicate-passive-navigate')
+          continue
+        }
         // 点击/回车引发的被动跳转：不单独成步，而是作为上一步的后置校验
         last.verification = { mode: 'url', expected: stabilizeVerificationUrl(url), timeoutMs: 5000 }
         drop(event, 'passive-navigate')
@@ -377,7 +420,8 @@ export function cleanTrace(trace: RecordingTrace): CleanResult {
   // 剔除「打开后立刻关闭、且中间没有任何页面操作」的空标签页
   const tabPageActionCount = new Map<string, number>()
   for (const step of steps) {
-    if (PAGE_ACTIONS.has(step.actionType)) {
+    // goto 也属于该标签页的有效使用（否则「新标签页 + 导航」会被误判为空标签页）
+    if (PAGE_ACTIONS.has(step.actionType) || step.actionType === 'goto') {
       tabPageActionCount.set(step.tabId, (tabPageActionCount.get(step.tabId) ?? 0) + 1)
     }
   }
